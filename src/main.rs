@@ -1,4 +1,5 @@
 use actix_web::{get, web, App, HttpServer, HttpResponse, http::header};
+use md5;
 
 #[get("/")]
 async fn home() -> HttpResponse {
@@ -22,6 +23,12 @@ async fn home() -> HttpResponse {
     <h2>Example</h2>
     <p>To get GitHub's favicon:</p>
     <pre>/url/github.com</pre>
+
+    <h2>Features</h2>
+    <ul>
+        <li>ETag support for efficient caching</li>
+        <li>HTTP cache headers</li>
+    </ul>
 </body>
 </html>"#;
 
@@ -31,7 +38,7 @@ async fn home() -> HttpResponse {
 }
 
 #[get("/url/{url}")]
-async fn get_favicon(url: web::Path<String>) -> HttpResponse {
+async fn get_favicon(url: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
     let client = reqwest::Client::new();
     let url_str = format!("https://{}/favicon.ico", url.into_inner());
     
@@ -40,9 +47,20 @@ async fn get_favicon(url: web::Path<String>) -> HttpResponse {
             if response.status().is_success() {
                 match response.bytes().await {
                     Ok(bytes) => {
+                        // Generate ETag from content
+                        let etag = format!("\"{:x}\"", md5::compute(&bytes));
+                        
+                        // Check if client sent If-None-Match header
+                        if let Some(if_none_match) = req.headers().get(header::IF_NONE_MATCH) {
+                            if if_none_match.to_str().unwrap_or("") == etag {
+                                return HttpResponse::NotModified().finish();
+                            }
+                        }
+
                         HttpResponse::Ok()
                             .content_type("image/x-icon")
                             .append_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                            .append_header((header::ETAG, etag))
                             .body(bytes)
                     },
                     Err(_) => HttpResponse::InternalServerError()
