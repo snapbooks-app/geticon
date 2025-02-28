@@ -13,5 +13,10 @@ EXPOSE 8080
 ENV RUST_LOG=info
 ENV RUST_BACKTRACE=0
 
+# Sentry configuration (DSN must be provided at runtime)
+ENV SENTRY_DSN=""
+ENV SENTRY_ENVIRONMENT="production"
+# Release is automatically set from Cargo.toml version
+
 # Run the binary
 CMD ["./target/release/geticon"]
