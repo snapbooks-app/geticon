@@ -72,8 +72,14 @@ jobs:
           echo "SHOULD_PUBLISH=$SHOULD_PUBLISH" >> $GITHUB_ENV
           echo "should_publish=$SHOULD_PUBLISH" >> $GITHUB_OUTPUT
 
+      - name: Skip notification
+        if: github.event_name != 'pull_request' && env.SHOULD_PUBLISH != 'true'
+        run: |
+          echo "Skipping build and push because version ${{ env.VERSION }} already exists in the registry"
+          echo "To publish a new version, update the version in Cargo.toml"
+
       - name: Log in to the Container registry
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && env.SHOULD_PUBLISH == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -82,6 +88,7 @@ jobs:
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
+        if: ${{ env.SHOULD_PUBLISH == 'true' || github.event_name == 'pull_request' }}
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
