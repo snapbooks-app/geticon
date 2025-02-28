@@ -1,5 +1,11 @@
 FROM rust:1-slim-bullseye
 
+# Install dependencies required for building
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /usr/src/app
 COPY . .
 
