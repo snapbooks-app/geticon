@@ -1,0 +1,16 @@
+# Cline Rules for GetIcon
+
+# Changelog Rules
+- When making changes to the project, update CHANGELOG.md
+- Add new entries under the [Unreleased] section
+- Use appropriate subsections: Added, Changed, Deprecated, Removed, Fixed, Security
+- When bumping version in Cargo.toml, create a new version section in CHANGELOG.md
+- Include the release date in YYYY-MM-DD format
+
+# README Rules
+- Keep README.md in sync with project features and functionality
+- Update API documentation when endpoints change
+- Update installation instructions when build process changes
+- Update environment variables section when new variables are added
+- Update features list when new features are implemented
+- Ensure Docker instructions remain accurate

@@ -4,13 +4,19 @@ A fast and efficient favicon fetching service built in Rust. GetIcon provides a 
 
 ## Features
 
-- 🚀 Simple REST API endpoint
+- 🚀 Simple REST API endpoints for both image and JSON responses
 - 📦 ETag support for efficient caching
 - ⚡ HTTP cache headers for improved performance
 - 🌐 Support for any website's favicon.ico
 - 📄 Built-in HTML documentation page
+- 🔍 Smart icon selection with size parameter support
+- 📱 Detection of multiple icon types (favicon.ico, Apple Touch, Web App Manifest)
+- 🔄 Docker support for easy deployment
+- 📊 Sentry integration for error monitoring (optional)
 
 ## Installation
+
+### Option 1: Using Rust
 
 1. Ensure you have Rust installed (1.75.0 or later)
 2. Clone the repository:
@@ -25,33 +31,93 @@ cargo run
 
 The server will start at `http://localhost:8080`
 
+### Option 2: Using Docker
+
+1. Pull the Docker image:
+```bash
+docker pull ghcr.io/yourusername/geticon:latest
+```
+
+2. Run the container:
+```bash
+docker run -p 8080:8080 ghcr.io/yourusername/geticon:latest
+```
+
+Or use Docker Compose:
+
+```yaml
+# docker-compose.yml
+version: '3'
+services:
+  geticon:
+    image: ghcr.io/yourusername/geticon:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - SENTRY_DSN=your_sentry_dsn  # Optional
+      - SENTRY_ENVIRONMENT=production  # Optional
+```
+
+Then run:
+```bash
+docker-compose up -d
+```
+
 ## Usage
 
-### API Endpoint
+### API Endpoints
+
+#### Get Favicon as Image
 
 ```
-GET /url/{website-url}
+GET /img?url={website-url}
 ```
 
-The API accepts a website URL (without protocol) and returns its favicon.
+Optional: Specify size with the `size` parameter:
+```
+GET /img?url={website-url}&size={size}
+```
+
+#### Get Favicon Information as JSON
+
+```
+GET /json?url={website-url}
+```
+
+Optional: Specify size with the `size` parameter:
+```
+GET /json?url={website-url}&size={size}
+```
 
 ### Examples
 
-To fetch GitHub's favicon:
+To fetch GitHub's favicon as an image:
 ```
-GET http://localhost:8080/url/github.com
-```
-
-To fetch Microsoft's favicon:
-```
-GET http://localhost:8080/url/microsoft.com
+GET http://localhost:8080/img?url=github.com
 ```
 
-### Response
+To fetch Microsoft's favicon at 192px size:
+```
+GET http://localhost:8080/img?url=microsoft.com&size=192
+```
 
-- Success: Returns the favicon with `image/x-icon` content type
+To get JSON information about Google's favicon:
+```
+GET http://localhost:8080/json?url=google.com
+```
+
+### Responses
+
+#### Image Endpoint
+- Success: Returns the favicon with appropriate content type (image/png, image/x-icon, etc.)
 - Not Found: Returns 404 if favicon doesn't exist
 - Not Modified: Returns 304 if favicon hasn't changed (when using ETag)
+
+#### JSON Endpoint
+Returns a JSON object with:
+- `url`: The normalized URL
+- `icons`: Array of all detected icons with their properties
+- `best_icon`: The selected best icon based on scoring algorithm
 
 ## Cache Support
 
@@ -60,13 +126,35 @@ GetIcon implements efficient caching through:
 - Cache-Control headers with a 1-hour max age
 - 304 Not Modified responses when content hasn't changed
 
+## Icon Detection
+
+GetIcon searches for icons in multiple locations:
+- Standard favicon.ico in site root
+- HTML link tags with rel="icon", "shortcut icon", etc.
+- Apple Touch icons
+- Web App Manifest icons
+- Microsoft Tile images
+- Open Graph images (as fallback)
+
+## Environment Variables
+
+The following environment variables can be configured:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| SENTRY_DSN | Sentry DSN for error monitoring | (none) |
+| SENTRY_ENVIRONMENT | Environment name for Sentry | production |
+
 ## Development
 
 Built with:
 - Rust
-- Actix-web framework
+- Actix-web framework for the HTTP server
 - reqwest for HTTP requests
+- scraper for HTML parsing
+- serde for JSON serialization
 - md5 for ETag generation
+- sentry for error monitoring
 
 ## License
 
