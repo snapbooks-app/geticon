@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2025-02-28
+
+### Added
+- Added curl to the Docker container for easier API testing and health checks
+
 ## [0.3.0] - 2025-02-28
 
 ### Added

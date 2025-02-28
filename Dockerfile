@@ -4,6 +4,7 @@ FROM rust:1-slim-bullseye
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
