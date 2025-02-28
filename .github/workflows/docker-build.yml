@@ -38,22 +38,34 @@ jobs:
       - name: Check if version exists
         id: version_check
         run: |
-          # Default to publishing if we can't determine
+          # Default to publishing
           SHOULD_PUBLISH=true
           
           # Only check for existing versions on main branch pushes
           if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            # Try to get the manifest for this version
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            # Get list of existing package versions using GitHub API
+            # Try both user and org endpoints since we don't know which one is applicable
+            RESPONSE=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
               -H "Accept: application/vnd.github.v3+json" \
-              "https://ghcr.io/v2/${{ github.repository }}/manifests/${{ env.VERSION }}" || echo "failed")
+              "https://api.github.com/user/packages/container/geticon/versions" || \
+            curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/orgs/${{ github.repository_owner }}/packages/container/geticon/versions")
             
-            if [[ "$STATUS" == "200" ]]; then
-              echo "Version ${{ env.VERSION }} already exists in the registry"
-              SHOULD_PUBLISH=false
+            # Check if the API call was successful
+            if [[ $(echo $RESPONSE | jq -r 'if type=="object" and has("message") then .message else empty end') ]]; then
+              echo "API Error: $(echo $RESPONSE | jq -r '.message')"
+              echo "Will publish anyway to be safe"
             else
-              echo "Version ${{ env.VERSION }} does not exist in the registry or couldn't be checked"
+              # Extract all tags from all versions
+              TAGS=$(echo $RESPONSE | jq -r '.[].metadata.container.tags[]' 2>/dev/null || echo "")
+              
+              if [[ $TAGS == *"${{ env.VERSION }}"* ]]; then
+                echo "Version ${{ env.VERSION }} already exists in the registry"
+                SHOULD_PUBLISH=false
+              else
+                echo "Version ${{ env.VERSION }} does not exist in the registry"
+              fi
             fi
           fi
           
@@ -86,12 +98,3 @@ jobs:
           push: ${{ github.event_name != 'pull_request' && env.SHOULD_PUBLISH == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-
-      - name: Make package public
-        if: github.event_name != 'pull_request' && env.SHOULD_PUBLISH == 'true'
-        run: |
-          curl -X PATCH \
-            -H "Accept: application/vnd.github.v3+json" \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            https://api.github.com/user/packages/container/${{ github.event.repository.name }}/visibility \
-            -d '{"visibility":"public"}'
