@@ -93,6 +93,7 @@ jobs:
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
+        if: ${{ env.SHOULD_PUBLISH == 'true' || github.event_name == 'pull_request' }}
         with:
           context: .
           push: ${{ github.event_name != 'pull_request' && env.SHOULD_PUBLISH == 'true' }}
