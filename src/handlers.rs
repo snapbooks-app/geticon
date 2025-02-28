@@ -30,6 +30,9 @@ pub async fn home() -> HttpResponse {
     
     <h3>Get favicon information as JSON:</h3>
     <pre>/json?url=https://google.com</pre>
+    
+    <h3>Health check endpoint:</h3>
+    <pre>/health</pre>
 
     <h2>Features</h2>
     <ul>
@@ -162,6 +165,14 @@ pub async fn get_favicon_img(
                 .body("Failed to fetch icon")
         }
     }
+}
+
+/// Health check endpoint
+#[get("/health")]
+pub async fn health_check() -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .body(r#"{"status":"ok","service":"geticon"}"#)
 }
 
 /// Handler for /json endpoint - returns favicon information as JSON

@@ -1,5 +1,5 @@
 use actix_web::{web::Data, App, HttpServer};
-use geticon::handlers::{home, get_favicon_img, get_favicon_json};
+use geticon::handlers::{home, get_favicon_img, get_favicon_json, health_check};
 use std::env;
 
 #[actix_web::main]
@@ -42,6 +42,7 @@ async fn main() -> std::io::Result<()> {
                 .service(home)
                 .service(get_favicon_img)
                 .service(get_favicon_json)
+                .service(health_check)
         })
         .bind("127.0.0.1:8080")?
         .run()
@@ -54,6 +55,7 @@ async fn main() -> std::io::Result<()> {
                 .service(home)
                 .service(get_favicon_img)
                 .service(get_favicon_json)
+                .service(health_check)
         })
         .bind("127.0.0.1:8080")?
         .run()

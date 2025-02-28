@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2025-02-28
+
+### Added
+- Health check endpoint at `/health` that returns service status
+
+### Changed
+- Updated Sentry dependency from 0.31 to 0.36
+
 ## [0.2.0] - 2025-02-28
 
 ### Changed

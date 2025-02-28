@@ -89,6 +89,14 @@ Optional: Specify size with the `size` parameter:
 GET /json?url={website-url}&size={size}
 ```
 
+#### Health Check
+
+```
+GET /health
+```
+
+Returns a JSON response with service status information.
+
 ### Examples
 
 To fetch GitHub's favicon as an image:
