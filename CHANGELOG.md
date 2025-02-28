@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2025-02-28
+- Changed server binding from 127.0.0.1 to 0.0.0.0 for container networking
+
 ## [0.3.1] - 2025-02-28
 
 ### Added

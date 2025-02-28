@@ -28,7 +28,7 @@ async fn main() -> std::io::Result<()> {
         None
     };
 
-    println!("GetIcon server running at http://localhost:8080");
+    println!("GetIcon server running at http://0.0.0.0:8080");
     
     let client = reqwest::Client::new();
     
@@ -44,7 +44,7 @@ async fn main() -> std::io::Result<()> {
                 .service(get_favicon_json)
                 .service(health_check)
         })
-        .bind("127.0.0.1:8080")?
+        .bind("0.0.0.0:8080")?
         .run()
         .await
     } else {
@@ -57,7 +57,7 @@ async fn main() -> std::io::Result<()> {
                 .service(get_favicon_json)
                 .service(health_check)
         })
-        .bind("127.0.0.1:8080")?
+        .bind("0.0.0.0:8080")?
         .run()
         .await
     }
