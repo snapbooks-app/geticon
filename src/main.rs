@@ -1,6 +1,8 @@
 use actix_web::{web::Data, App, HttpServer};
 use geticon::handlers::{home, get_favicon_img, get_favicon_json, health_check};
+use geticon::cache::create_default_icon_cache;
 use std::env;
+use std::sync::Arc;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -32,12 +34,17 @@ async fn main() -> std::io::Result<()> {
     
     let client = reqwest::Client::new();
     
+    // Create icon cache
+    let icon_cache = Arc::new(create_default_icon_cache());
+    println!("Initialized icon cache with 1-hour TTL");
+    
     // Run server with or without Sentry based on environment variable
     if sentry_enabled {
         println!("Running with Sentry middleware enabled");
         HttpServer::new(move || {
             App::new()
                 .app_data(Data::new(client.clone()))
+                .app_data(Data::new(icon_cache.clone()))
                 .wrap(sentry_actix::Sentry::new())
                 .service(home)
                 .service(get_favicon_img)
@@ -52,6 +59,7 @@ async fn main() -> std::io::Result<()> {
         HttpServer::new(move || {
             App::new()
                 .app_data(Data::new(client.clone()))
+                .app_data(Data::new(icon_cache.clone()))
                 .service(home)
                 .service(get_favicon_img)
                 .service(get_favicon_json)

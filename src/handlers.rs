@@ -3,7 +3,10 @@ use md5;
 use crate::url_utils::normalize_url;
 use crate::models::IconResponse;
 use crate::favicon::{get_page_icons, find_best_icon_for_size};
+use crate::cache::IconCache;
 use std::env;
+use std::sync::Arc;
+use bytes::Bytes;
 
 /// Home page handler with documentation
 #[get("/")]
@@ -40,7 +43,8 @@ pub async fn home() -> HttpResponse {
         <li>Detects multiple icon types including web app manifests</li>
         <li>Smart icon selection based on quality scoring</li>
         <li>Returns image dimensions and purpose information</li>
-        <li>ETag support for efficient caching</li>
+        <li>Server-side caching for consistent results</li>
+        <li>ETag support for efficient client-side caching</li>
     </ul>
     
     <h2>Icon Detection</h2>
@@ -74,7 +78,8 @@ pub async fn home() -> HttpResponse {
 pub async fn get_favicon_img(
     url: web::Query<std::collections::HashMap<String, String>>,
     req: HttpRequest,
-    client: web::Data<reqwest::Client>
+    client: web::Data<reqwest::Client>,
+    cache: web::Data<Arc<IconCache>>
 ) -> HttpResponse {
     
     // Get and validate URL
@@ -91,7 +96,30 @@ pub async fn get_favicon_img(
     // Get size parameter if provided
     let requested_size = url.get("size").and_then(|s| s.parse::<u32>().ok());
     
-    // Try to get icons
+    // Create a cache key that includes the size parameter if provided
+    let cache_key = match requested_size {
+        Some(size) => format!("{}:{}", normalized_url, size),
+        None => normalized_url.to_string(),
+    };
+    
+    // Check if the icon is in the cache
+    if let Some(cached_entry) = cache.get(&cache_key).await {
+        // Check if the client has the same version (ETag)
+        if let Some(if_none_match) = req.headers().get(header::IF_NONE_MATCH) {
+            if if_none_match.to_str().unwrap_or("") == cached_entry.etag {
+                return HttpResponse::NotModified().finish();
+            }
+        }
+        
+        // Return the cached icon
+        return HttpResponse::Ok()
+            .content_type(cached_entry.content_type.as_str())
+            .append_header((header::CACHE_CONTROL, "public, max-age=3600"))
+            .append_header((header::ETAG, cached_entry.etag.clone()))
+            .body(cached_entry.content.clone());
+    }
+    
+    // If not in cache, fetch icons from the website
     let icons = get_page_icons(client.as_ref(), &normalized_url).await;
     
     if icons.is_empty() {
@@ -112,11 +140,20 @@ pub async fn get_favicon_img(
                     Ok(bytes) => {
                         let etag = format!("\"{:x}\"", md5::compute(&bytes));
                         
+                        // Check if the client has the same version
                         if let Some(if_none_match) = req.headers().get(header::IF_NONE_MATCH) {
                             if if_none_match.to_str().unwrap_or("") == etag {
                                 return HttpResponse::NotModified().finish();
                             }
                         }
+                        
+                        // Store in cache
+                        cache.insert(
+                            cache_key,
+                            bytes.clone(),
+                            best_icon.content_type.clone(),
+                            etag.clone()
+                        ).await;
 
                         HttpResponse::Ok()
                             .content_type(best_icon.content_type.as_str())
@@ -179,7 +216,8 @@ pub async fn health_check() -> HttpResponse {
 #[get("/json")]
 pub async fn get_favicon_json(
     url: web::Query<std::collections::HashMap<String, String>>,
-    client: web::Data<reqwest::Client>
+    client: web::Data<reqwest::Client>,
+    cache: web::Data<Arc<IconCache>>
 ) -> HttpResponse {
     
     // Get and validate URL
@@ -196,7 +234,23 @@ pub async fn get_favicon_json(
     // Get size parameter if provided
     let requested_size = url.get("size").and_then(|s| s.parse::<u32>().ok());
     
-    // Get icons
+    // Create a cache key that includes the size parameter if provided
+    let cache_key = match requested_size {
+        Some(size) => format!("{}:json:{}", normalized_url, size),
+        None => format!("{}:json", normalized_url),
+    };
+    
+    // Check if the response is in the cache
+    if let Some(cached_entry) = cache.get(&cache_key).await {
+        // Return the cached JSON response
+        return HttpResponse::Ok()
+            .content_type(cached_entry.content_type.as_str())
+            .append_header((header::CACHE_CONTROL, "public, max-age=3600"))
+            .append_header((header::ETAG, cached_entry.etag.clone()))
+            .body(cached_entry.content.clone());
+    }
+    
+    // If not in cache, fetch icons from the website
     let icons = get_page_icons(client.as_ref(), &normalized_url).await;
     
     if icons.is_empty() {
@@ -216,8 +270,21 @@ pub async fn get_favicon_json(
     
     match serde_json::to_string(&response) {
         Ok(json) => {
+            // Generate ETag for the JSON response
+            let etag = format!("\"{:x}\"", md5::compute(json.as_bytes()));
+            
+            // Store in cache (as bytes for consistency with the image endpoint)
+            cache.insert(
+                cache_key,
+                Bytes::from(json.clone()),
+                "application/json".to_string(),
+                etag.clone()
+            ).await;
+            
             HttpResponse::Ok()
                 .content_type("application/json")
+                .append_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                .append_header((header::ETAG, etag))
                 .body(json)
         },
         Err(err) => {

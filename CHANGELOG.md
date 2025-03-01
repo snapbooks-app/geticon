@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2025-03-01
+
+### Added
+- Server-side caching for icons to ensure consistent results
+- Cache keys include size parameter for size-specific caching
+- Memory cache with 1-hour TTL for improved performance
+
 ## [0.3.2] - 2025-02-28
 - Changed server binding from 127.0.0.1 to 0.0.0.0 for container networking
 

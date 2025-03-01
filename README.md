@@ -5,7 +5,8 @@ A fast and efficient favicon fetching service built in Rust. GetIcon provides a 
 ## Features
 
 - 🚀 Simple REST API endpoints for both image and JSON responses
-- 📦 ETag support for efficient caching
+- 📦 Server-side caching for consistent results
+- 🔄 ETag support for efficient client-side caching
 - ⚡ HTTP cache headers for improved performance
 - 🌐 Support for any website's favicon.ico
 - 📄 Built-in HTML documentation page
@@ -130,6 +131,8 @@ Returns a JSON object with:
 ## Cache Support
 
 GetIcon implements efficient caching through:
+- Server-side in-memory cache with 1-hour TTL
+- Consistent icon selection for the same URL and size
 - ETag headers for client-side caching
 - Cache-Control headers with a 1-hour max age
 - 304 Not Modified responses when content hasn't changed
@@ -162,6 +165,7 @@ Built with:
 - scraper for HTML parsing
 - serde for JSON serialization
 - md5 for ETag generation
+- moka for high-performance in-memory caching
 - sentry for error monitoring
 
 ## License
