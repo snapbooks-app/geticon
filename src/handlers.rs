@@ -120,11 +120,10 @@ pub async fn get_favicon_img(
     }
     
     // If not in cache, fetch icons from the website
-    let icons = get_page_icons(client.as_ref(), &normalized_url).await;
-    
-    if icons.is_empty() {
-        return HttpResponse::NotFound().body("No icons found");
-    }
+    let icons = match get_page_icons(client.as_ref(), &normalized_url).await {
+        icons if !icons.is_empty() => icons,
+        _ => return HttpResponse::NotFound().body("No icons found")
+    };
     
     // Select the best icon based on requested size or highest score
     let best_icon = match find_best_icon_for_size(&icons, requested_size) {
@@ -198,8 +197,17 @@ pub async fn get_favicon_img(
                 );
             }
             
-            HttpResponse::InternalServerError()
-                .body("Failed to fetch icon")
+            // Determine appropriate status code based on error type
+            if err.is_timeout() {
+                HttpResponse::GatewayTimeout()
+                    .body(format!("Request timed out while fetching icon: {}", err))
+            } else if err.is_connect() {
+                HttpResponse::BadGateway()
+                    .body(format!("Connection error while fetching icon: {}", err))
+            } else {
+                HttpResponse::InternalServerError()
+                    .body(format!("Failed to fetch icon: {}", err))
+            }
         }
     }
 }
@@ -251,11 +259,10 @@ pub async fn get_favicon_json(
     }
     
     // If not in cache, fetch icons from the website
-    let icons = get_page_icons(client.as_ref(), &normalized_url).await;
-    
-    if icons.is_empty() {
-        return HttpResponse::NotFound().body("No icons found");
-    }
+    let icons = match get_page_icons(client.as_ref(), &normalized_url).await {
+        icons if !icons.is_empty() => icons,
+        _ => return HttpResponse::NotFound().body("No icons found")
+    };
     
     // Select best icon based on requested size or highest score
     let best_icon = find_best_icon_for_size(&icons, requested_size)
@@ -297,7 +304,7 @@ pub async fn get_favicon_json(
             }
             
             HttpResponse::InternalServerError()
-                .body("Failed to generate JSON response")
+                .body(format!("Failed to generate JSON response: {}", err))
         }
     }
 }

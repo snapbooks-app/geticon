@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2025-03-04
+
+### Fixed
+- Disabled certificate validation to fix issues with sites using certificates from unknown issuers
+- Improved error handling with more specific HTTP status codes for different types of network errors
+- Added more detailed error messages to help with debugging
+
 ## [0.4.0] - 2025-03-01
 
 ### Added

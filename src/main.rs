@@ -32,7 +32,13 @@ async fn main() -> std::io::Result<()> {
 
     println!("GetIcon server running at http://0.0.0.0:8080");
     
-    let client = reqwest::Client::new();
+    // Create a client with disabled certificate validation
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to build reqwest client");
+    
+    println!("Created HTTP client with certificate validation disabled");
     
     // Create icon cache
     let icon_cache = Arc::new(create_default_icon_cache());
