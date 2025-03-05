@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2025-03-05
+
+### Fixed
+- Fixed 404 errors when fetching favicons from sites with strict security measures by forwarding client headers
+- Added header forwarding to improve compatibility with sites that implement bot detection
+- Enhanced error logging for favicon fetching failures
+
 ## [0.4.1] - 2025-03-04
 
 ### Fixed

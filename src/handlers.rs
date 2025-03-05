@@ -7,6 +7,7 @@ use crate::cache::IconCache;
 use std::env;
 use std::sync::Arc;
 use bytes::Bytes;
+use std::collections::HashMap;
 
 /// Home page handler with documentation
 #[get("/")]
@@ -73,6 +74,43 @@ pub async fn home() -> HttpResponse {
         .body(html)
 }
 
+/// Extract important headers to forward to target sites
+fn extract_headers_to_forward(req: &HttpRequest) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    
+    // Extract User-Agent
+    if let Some(user_agent) = req.headers().get(header::USER_AGENT) {
+        if let Ok(value) = user_agent.to_str() {
+            headers.insert("User-Agent".to_string(), value.to_string());
+        }
+    }
+    
+    // Extract Accept header
+    if let Some(accept) = req.headers().get(header::ACCEPT) {
+        if let Ok(value) = accept.to_str() {
+            headers.insert("Accept".to_string(), value.to_string());
+        }
+    }
+    
+    // Extract Accept-Language header
+    if let Some(accept_lang) = req.headers().get(header::ACCEPT_LANGUAGE) {
+        if let Ok(value) = accept_lang.to_str() {
+            headers.insert("Accept-Language".to_string(), value.to_string());
+        }
+    }
+    
+    // Extract Sec-Ch-Ua headers
+    for header_name in &["Sec-Ch-Ua", "Sec-Ch-Ua-Mobile", "Sec-Ch-Ua-Platform"] {
+        if let Some(header_value) = req.headers().get(*header_name) {
+            if let Ok(value) = header_value.to_str() {
+                headers.insert(header_name.to_string(), value.to_string());
+            }
+        }
+    }
+    
+    headers
+}
+
 /// Handler for /img endpoint - returns the best favicon as an image
 #[get("/img")]
 pub async fn get_favicon_img(
@@ -119,10 +157,22 @@ pub async fn get_favicon_img(
             .body(cached_entry.content.clone());
     }
     
+    // Extract headers to forward
+    let forwarded_headers = extract_headers_to_forward(&req);
+    
     // If not in cache, fetch icons from the website
-    let icons = match get_page_icons(client.as_ref(), &normalized_url).await {
+    let icons = match get_page_icons(client.as_ref(), &normalized_url, Some(&forwarded_headers)).await {
         icons if !icons.is_empty() => icons,
-        _ => return HttpResponse::NotFound().body("No icons found")
+        _ => {
+            // Log the failure with more details
+            if env::var("SENTRY_DSN").is_ok() {
+                sentry::capture_message(
+                    &format!("Failed to find icons for URL: {}", normalized_url),
+                    sentry::Level::Warning
+                );
+            }
+            return HttpResponse::NotFound().body("No icons found")
+        }
     };
     
     // Select the best icon based on requested size or highest score
@@ -224,6 +274,7 @@ pub async fn health_check() -> HttpResponse {
 #[get("/json")]
 pub async fn get_favicon_json(
     url: web::Query<std::collections::HashMap<String, String>>,
+    req: HttpRequest,
     client: web::Data<reqwest::Client>,
     cache: web::Data<Arc<IconCache>>
 ) -> HttpResponse {
@@ -258,8 +309,11 @@ pub async fn get_favicon_json(
             .body(cached_entry.content.clone());
     }
     
+    // Extract headers to forward
+    let forwarded_headers = extract_headers_to_forward(&req);
+    
     // If not in cache, fetch icons from the website
-    let icons = match get_page_icons(client.as_ref(), &normalized_url).await {
+    let icons = match get_page_icons(client.as_ref(), &normalized_url, Some(&forwarded_headers)).await {
         icons if !icons.is_empty() => icons,
         _ => return HttpResponse::NotFound().body("No icons found")
     };

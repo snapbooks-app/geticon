@@ -1,11 +1,15 @@
 use reqwest;
 use scraper::{Html, Selector};
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use url::Url;
 use crate::models::Icon;
 
 /// Gets all available icons from a webpage with enhanced detection
-pub async fn get_page_icons(client: &reqwest::Client, url: &Url) -> Vec<Icon> {
+pub async fn get_page_icons(
+    client: &reqwest::Client, 
+    url: &Url,
+    forwarded_headers: Option<&HashMap<String, String>>
+) -> Vec<Icon> {
     let mut icons = HashSet::new();
     
     // Try direct favicon.ico
@@ -34,7 +38,16 @@ pub async fn get_page_icons(client: &reqwest::Client, url: &Url) -> Vec<Icon> {
     let mut manifest_urls = Vec::new();
     
     // Try fetching HTML and parsing link tags
-    if let Ok(response) = client.get(url.as_str()).send().await {
+    let mut request_builder = client.get(url.as_str());
+    
+    // Apply forwarded headers if provided
+    if let Some(headers) = forwarded_headers {
+        for (name, value) in headers {
+            request_builder = request_builder.header(name, value);
+        }
+    }
+    
+    if let Ok(response) = request_builder.send().await {
         if let Ok(text) = response.text().await {
             let document = Html::parse_document(&text);
             
@@ -178,7 +191,16 @@ pub async fn get_page_icons(client: &reqwest::Client, url: &Url) -> Vec<Icon> {
     
     // Process manifest files
     for manifest_url in manifest_urls {
-        if let Ok(manifest_response) = client.get(manifest_url.as_str()).send().await {
+        let mut manifest_req = client.get(manifest_url.as_str());
+        
+        // Apply forwarded headers to manifest requests too
+        if let Some(headers) = forwarded_headers {
+            for (name, value) in headers {
+                manifest_req = manifest_req.header(name, value);
+            }
+        }
+        
+        if let Ok(manifest_response) = manifest_req.send().await {
             if let Ok(manifest_text) = manifest_response.text().await {
                 if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest_text) {
                     if let Some(manifest_icons) = manifest.get("icons").and_then(|i| i.as_array()) {
