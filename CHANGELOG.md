@@ -5,6 +5,23 @@ All notable changes to the GetIcon project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2025-03-08
+
+### Changed
+- Created dedicated validation module to improve code organization
+- Refactored server initialization for better maintainability
+
+### Added
+- Structured logging system with `log` and `env_logger`
+- Smart User-Agent selection based on icon type (iOS/Android/Windows)
+- Robust icon validation to prevent returning invalid content
+- Fallback mechanism for finding alternative icons when primary sources fail
+
+### Fixed
+- Fixed empty icon issues for sites like happybytes.no
+- Fixed HTML page redirects for sites like burgerking.no
+- Improved handling of PNG files with valid signatures but unsupported features
+
 ## [Unreleased]
 
 ## [0.4.2] - 2025-03-05

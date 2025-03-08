@@ -3,16 +3,23 @@ use geticon::handlers::{home, get_favicon_img, get_favicon_json, health_check};
 use geticon::cache::create_default_icon_cache;
 use std::env;
 use std::sync::Arc;
+use log::{info, warn, debug};
+use env_logger::Env;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // Initialize env_logger
+    env_logger::init_from_env(Env::default().default_filter_or("info"));
+    
+    info!("Starting GetIcon v{}", env!("CARGO_PKG_VERSION"));
+    
     // Check if Sentry DSN is provided
     let sentry_enabled = env::var("SENTRY_DSN").is_ok();
     
     // Initialize Sentry if DSN is provided
     let _guard = if sentry_enabled {
         let dsn = env::var("SENTRY_DSN").unwrap();
-        println!("Initializing Sentry with release: {}", env!("CARGO_PKG_VERSION"));
+        info!("Initializing Sentry with release: {}", env!("CARGO_PKG_VERSION"));
         
         // Get optional environment variable
         let environment = env::var("SENTRY_ENVIRONMENT").unwrap_or_else(|_| "production".into());
@@ -26,11 +33,11 @@ async fn main() -> std::io::Result<()> {
             },
         )))
     } else {
-        println!("Sentry DSN not found, error monitoring disabled");
+        info!("Sentry DSN not found, error monitoring disabled");
         None
     };
 
-    println!("GetIcon server running at http://0.0.0.0:8080");
+    info!("GetIcon server running at http://0.0.0.0:8080");
     
     // Create a client with disabled certificate validation
     let client = reqwest::Client::builder()
@@ -38,15 +45,22 @@ async fn main() -> std::io::Result<()> {
         .build()
         .expect("Failed to build reqwest client");
     
-    println!("Created HTTP client with certificate validation disabled");
+    debug!("Created HTTP client with certificate validation disabled");
     
     // Create icon cache
     let icon_cache = Arc::new(create_default_icon_cache());
-    println!("Initialized icon cache with 1-hour TTL");
+    debug!("Initialized icon cache with 1-hour TTL");
     
-    // Run server with or without Sentry based on environment variable
+    // Log middleware status
     if sentry_enabled {
-        println!("Running with Sentry middleware enabled");
+        info!("Running with Sentry middleware enabled");
+    } else {
+        info!("Running without Sentry middleware");
+    }
+    
+    // Run server with or without Sentry middleware based on environment variable
+    if sentry_enabled {
+        // With Sentry middleware
         HttpServer::new(move || {
             App::new()
                 .app_data(Data::new(client.clone()))
@@ -61,7 +75,7 @@ async fn main() -> std::io::Result<()> {
         .run()
         .await
     } else {
-        println!("Running without Sentry middleware");
+        // Without Sentry middleware
         HttpServer::new(move || {
             App::new()
                 .app_data(Data::new(client.clone()))

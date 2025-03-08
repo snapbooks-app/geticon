@@ -1,17 +1,21 @@
 use actix_web::{get, web, HttpResponse, HttpRequest, http::header};
 use md5;
 use crate::url_utils::normalize_url;
-use crate::models::IconResponse;
-use crate::favicon::{get_page_icons, find_best_icon_for_size};
+use crate::models::{IconResponse, Icon};
+use crate::favicon::{get_page_icons, find_best_icon_for_size, select_user_agent_for_icon};
+use crate::validation::{validate_icons, validate_image_content, is_html_content, is_image_content_type};
 use crate::cache::IconCache;
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 use bytes::Bytes;
 use std::collections::HashMap;
+use log::{info, warn, debug, error, trace};
 
 /// Home page handler with documentation
 #[get("/")]
 pub async fn home() -> HttpResponse {
+    debug!("Serving home page");
     let html = r#"<!DOCTYPE html>
 <html>
 <head>
@@ -111,6 +115,8 @@ fn extract_headers_to_forward(req: &HttpRequest) -> HashMap<String, String> {
     headers
 }
 
+// Use the validate_icons function from the validation module
+
 /// Handler for /img endpoint - returns the best favicon as an image
 #[get("/img")]
 pub async fn get_favicon_img(
@@ -119,6 +125,7 @@ pub async fn get_favicon_img(
     client: web::Data<reqwest::Client>,
     cache: web::Data<Arc<IconCache>>
 ) -> HttpResponse {
+    debug!("Image favicon request received");
     
     // Get and validate URL
     let url_str = match url.get("url") {
@@ -165,6 +172,9 @@ pub async fn get_favicon_img(
         icons if !icons.is_empty() => icons,
         _ => {
             // Log the failure with more details
+            warn!("Failed to find icons for URL: {}", normalized_url);
+            
+            // Also send to Sentry if enabled
             if env::var("SENTRY_DSN").is_ok() {
                 sentry::capture_message(
                     &format!("Failed to find icons for URL: {}", normalized_url),
@@ -175,18 +185,150 @@ pub async fn get_favicon_img(
         }
     };
     
-    // Select the best icon based on requested size or highest score
-    let best_icon = match find_best_icon_for_size(&icons, requested_size) {
+    // Validate icons
+    let validated_icons = validate_icons(client.as_ref(), &icons, &forwarded_headers).await;
+    
+    // If no icons passed validation, return a 404
+    if validated_icons.is_empty() {
+        return HttpResponse::NotFound().body("No valid icons found");
+    }
+    
+    // Select the best icon based on requested size or highest score from validated icons
+    let best_icon = match find_best_icon_for_size(&validated_icons, requested_size) {
         Some(icon) => icon,
         None => return HttpResponse::NotFound().body("No suitable icon found"),
     };
     
-    // Fetch the icon
-    match client.get(&best_icon.url).send().await {
+    // Create a copy of forwarded headers that we can modify
+    let mut headers = forwarded_headers.clone();
+    
+    // Override the User-Agent with our selected one based on icon type
+    headers.insert("User-Agent".to_string(), select_user_agent_for_icon(best_icon).to_string());
+    
+    // Fetch the icon with the appropriate User-Agent
+    let mut request_builder = client.get(&best_icon.url);
+    
+    // Apply headers
+    for (name, value) in &headers {
+        request_builder = request_builder.header(name, value);
+    }
+    
+    // Send the request
+    match request_builder.send().await {
         Ok(response) => {
+            // Check if the response was redirected to a non-image resource
+            let final_url = response.url().to_string();
+            if final_url != best_icon.url {
+                // The request was redirected, check if the final URL is still an image
+                if let Some(content_type) = response.headers().get(header::CONTENT_TYPE) {
+                    if let Ok(content_type_str) = content_type.to_str() {
+                        // If redirected to a non-image resource (like HTML), reject it
+                        if !content_type_str.starts_with("image/") {
+                            // Log the redirect
+                            warn!("Icon redirected to non-image resource: {} -> {} (Content-Type: {})", 
+                                best_icon.url, final_url, content_type_str);
+                            
+                            // Also send to Sentry if enabled
+                            if env::var("SENTRY_DSN").is_ok() {
+                                sentry::capture_message(
+                                    &format!("Icon redirected to non-image resource: {} -> {} (Content-Type: {})", 
+                                        best_icon.url, final_url, content_type_str),
+                                    sentry::Level::Warning
+                                );
+                            }
+                            
+                            return HttpResponse::NotFound()
+                                .body(format!("Icon redirected to non-image resource: {}", final_url));
+                        }
+                    }
+                }
+            }
+            
+            // Check content type header to ensure it's an image
+            if let Some(content_type) = response.headers().get(header::CONTENT_TYPE) {
+                if let Ok(content_type_str) = content_type.to_str() {
+                    if !content_type_str.starts_with("image/") {
+                        // Log the invalid content type
+                        warn!("Invalid content type for icon: {} (Content-Type: {})", 
+                            best_icon.url, content_type_str);
+                        
+                        // Also send to Sentry if enabled
+                        if env::var("SENTRY_DSN").is_ok() {
+                            sentry::capture_message(
+                                &format!("Invalid content type for icon: {} (Content-Type: {})", 
+                                    best_icon.url, content_type_str),
+                                sentry::Level::Warning
+                            );
+                        }
+                        
+                        return HttpResponse::NotFound()
+                            .body(format!("Invalid content type for icon: {}", content_type_str));
+                    }
+                }
+            }
+            
             if response.status().is_success() {
                 match response.bytes().await {
                     Ok(bytes) => {
+                        // Validate content size
+                        if bytes.is_empty() {
+                            // Log the zero-size icon
+                            warn!("Zero-size icon detected for URL: {} from icon URL: {}", 
+                                normalized_url, best_icon.url);
+                            
+                            // Also send to Sentry if enabled
+                            if env::var("SENTRY_DSN").is_ok() {
+                                sentry::capture_message(
+                                    &format!("Zero-size icon detected for URL: {} from icon URL: {}", 
+                                        normalized_url, best_icon.url),
+                                    sentry::Level::Warning
+                                );
+                            }
+                            
+                            return HttpResponse::NotFound()
+                                .body("Icon found but has zero size");
+                        }
+                        
+                        // Check for HTML content disguised as an image
+                        if is_html_content(&bytes) {
+                            // Log the HTML content disguised as an image
+                            warn!("HTML content disguised as an image for URL: {} from icon URL: {}", 
+                                normalized_url, best_icon.url);
+                            
+                            // Also send to Sentry if enabled
+                            if env::var("SENTRY_DSN").is_ok() {
+                                sentry::capture_message(
+                                    &format!("HTML content disguised as an image for URL: {} from icon URL: {}", 
+                                        normalized_url, best_icon.url),
+                                    sentry::Level::Warning
+                                );
+                            }
+                            
+                            return HttpResponse::NotFound()
+                                .body("Icon found but content is HTML, not an image");
+                        }
+                        
+                        // Validate image content using our validation function
+                        let is_valid_image = validate_image_content(&bytes, &best_icon.content_type);
+                        
+                        if !is_valid_image {
+                            // Log the invalid image
+                            warn!("Invalid image content for URL: {} from icon URL: {}", 
+                                normalized_url, best_icon.url);
+                            
+                            // Also send to Sentry if enabled
+                            if env::var("SENTRY_DSN").is_ok() {
+                                sentry::capture_message(
+                                    &format!("Invalid image content for URL: {} from icon URL: {}", 
+                                        normalized_url, best_icon.url),
+                                    sentry::Level::Warning
+                                );
+                            }
+                            
+                            return HttpResponse::NotFound()
+                                .body("Icon found but content is not a valid image");
+                        }
+                        
                         let etag = format!("\"{:x}\"", md5::compute(&bytes));
                         
                         // Check if the client has the same version
@@ -211,7 +353,10 @@ pub async fn get_favicon_img(
                             .body(bytes)
                     },
                     Err(err) => {
-                        // Capture error with Sentry if enabled
+                        // Log the error
+                        error!("Failed to read icon content: {}", err);
+                        
+                        // Also send to Sentry if enabled
                         if env::var("SENTRY_DSN").is_ok() {
                             sentry::capture_message(
                                 &format!("Failed to read icon content: {}", err),
@@ -226,7 +371,10 @@ pub async fn get_favicon_img(
             } else {
                 let status = response.status();
                 
-                // Capture error with Sentry if enabled
+                // Log the error
+                warn!("Icon not found. Status: {}", status);
+                
+                // Also send to Sentry if enabled
                 if env::var("SENTRY_DSN").is_ok() {
                     sentry::capture_message(
                         &format!("Icon not found. Status: {}", status),
@@ -239,7 +387,10 @@ pub async fn get_favicon_img(
             }
         }
         Err(err) => {
-            // Capture error with Sentry if enabled
+            // Log the error
+            error!("Failed to fetch icon: {}", err);
+            
+            // Also send to Sentry if enabled
             if env::var("SENTRY_DSN").is_ok() {
                 sentry::capture_message(
                     &format!("Failed to fetch icon: {}", err),
@@ -249,12 +400,15 @@ pub async fn get_favicon_img(
             
             // Determine appropriate status code based on error type
             if err.is_timeout() {
+                warn!("Request timed out while fetching icon: {}", err);
                 HttpResponse::GatewayTimeout()
                     .body(format!("Request timed out while fetching icon: {}", err))
             } else if err.is_connect() {
+                warn!("Connection error while fetching icon: {}", err);
                 HttpResponse::BadGateway()
                     .body(format!("Connection error while fetching icon: {}", err))
             } else {
+                error!("Failed to fetch icon: {}", err);
                 HttpResponse::InternalServerError()
                     .body(format!("Failed to fetch icon: {}", err))
             }
@@ -265,6 +419,7 @@ pub async fn get_favicon_img(
 /// Health check endpoint
 #[get("/health")]
 pub async fn health_check() -> HttpResponse {
+    debug!("Health check requested");
     HttpResponse::Ok()
         .content_type("application/json")
         .body(r#"{"status":"ok","service":"geticon"}"#)
@@ -278,6 +433,7 @@ pub async fn get_favicon_json(
     client: web::Data<reqwest::Client>,
     cache: web::Data<Arc<IconCache>>
 ) -> HttpResponse {
+    debug!("JSON favicon request received");
     
     // Get and validate URL
     let url_str = match url.get("url") {
@@ -315,17 +471,36 @@ pub async fn get_favicon_json(
     // If not in cache, fetch icons from the website
     let icons = match get_page_icons(client.as_ref(), &normalized_url, Some(&forwarded_headers)).await {
         icons if !icons.is_empty() => icons,
-        _ => return HttpResponse::NotFound().body("No icons found")
+        _ => {
+            warn!("Failed to find icons for URL: {}", normalized_url);
+            return HttpResponse::NotFound().body("No icons found");
+        }
     };
     
     // Select best icon based on requested size or highest score
-    let best_icon = find_best_icon_for_size(&icons, requested_size)
+    let _best_icon = find_best_icon_for_size(&icons, requested_size)
         .cloned();
+    
+    // Validate icons
+    let final_icons = validate_icons(client.as_ref(), &icons, &forwarded_headers).await;
+    
+    // If no icons passed validation, return a 404
+    if final_icons.is_empty() {
+        warn!("No valid icons found for URL: {}", normalized_url);
+        return HttpResponse::NotFound().body("No valid icons found");
+    }
+    
+    // Recalculate the best icon based on the validated icons
+    let best_icon = if !final_icons.is_empty() {
+        find_best_icon_for_size(&final_icons, requested_size).cloned()
+    } else {
+        None
+    };
     
     // Create response
     let response = IconResponse {
         url: normalized_url.host_str().unwrap_or(url_str).to_string(),
-        icons: icons.clone(),
+        icons: final_icons,
         best_icon,
     };
     
@@ -349,7 +524,10 @@ pub async fn get_favicon_json(
                 .body(json)
         },
         Err(err) => {
-            // Capture error with Sentry if enabled
+            // Log the error
+            error!("Failed to serialize JSON response: {}", err);
+            
+            // Also send to Sentry if enabled
             if env::var("SENTRY_DSN").is_ok() {
                 sentry::capture_message(
                     &format!("Failed to serialize JSON response: {}", err),

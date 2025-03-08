@@ -55,6 +55,7 @@ services:
     ports:
       - "8080:8080"
     environment:
+      - RUST_LOG=info  # Controls log level
       - SENTRY_DSN=your_sentry_dsn  # Optional
       - SENTRY_ENVIRONMENT=production  # Optional
 ```
@@ -147,12 +148,28 @@ GetIcon searches for icons in multiple locations:
 - Microsoft Tile images
 - Open Graph images (as fallback)
 
+## User-Agent Handling
+
+GetIcon uses device-specific User-Agent strings to improve compatibility with websites that implement strict security measures:
+
+- Apple Touch Icons: iOS/Safari User-Agent
+- Android/Maskable Icons: Android/Chrome User-Agent
+- Microsoft Tile Images: Windows/Edge User-Agent
+- Standard Icons: Windows/Chrome User-Agent
+
+The User-Agent strings are periodically updated from [useragents.me](https://www.useragents.me) to ensure they remain current and effective.
+
+### Maintenance Note
+
+To keep the service working optimally with all websites, the User-Agent strings should be updated periodically (recommended: every 3-6 months) by checking the latest common User-Agents at [useragents.me](https://www.useragents.me).
+
 ## Environment Variables
 
 The following environment variables can be configured:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| RUST_LOG | Controls log filtering (e.g., `info`, `geticon=debug`, `debug`) | info |
 | SENTRY_DSN | Sentry DSN for error monitoring | (none) |
 | SENTRY_ENVIRONMENT | Environment name for Sentry | production |
 
@@ -166,6 +183,7 @@ Built with:
 - serde for JSON serialization
 - md5 for ETag generation
 - moka for high-performance in-memory caching
+- log and env_logger for structured logging
 - sentry for error monitoring
 
 ## License

@@ -1,6 +1,6 @@
 [package]
 name = "geticon"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 
 [dependencies]
@@ -16,6 +16,8 @@ sentry = "0.36"
 sentry-actix = "0.36"
 moka = { version = "0.12", features = ["future"] }
 bytes = "1.5"
+log = "0.4"
+env_logger = "0.11"
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["full", "test-util"] }

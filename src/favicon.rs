@@ -3,14 +3,135 @@ use scraper::{Html, Selector};
 use std::collections::{HashSet, HashMap};
 use url::Url;
 use crate::models::Icon;
+use crate::validation;
+use std::time::Duration;
+use log::{info, warn, debug, error, trace};
 
-/// Gets all available icons from a webpage with enhanced detection
+/// Selects an appropriate User-Agent string based on icon type
+/// User-Agents sourced from https://www.useragents.me (last updated: March 2025)
+pub fn select_user_agent_for_icon(icon: &Icon) -> &'static str {
+    // Check for Apple icons
+    if icon.url.contains("apple-touch-icon") || 
+       (icon.purpose.as_ref().map_or(false, |p| p.contains("apple-touch-icon"))) {
+        // iOS/Safari User-Agent
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1.1 Mobile/15E148 Safari/604.1"
+    } 
+    // Check for Android/maskable icons
+    else if icon.purpose.as_ref().map_or(false, |p| p.contains("maskable")) {
+        // Android/Chrome User-Agent
+        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36"
+    }
+    // Check for Microsoft icons
+    else if icon.purpose.as_ref().map_or(false, |p| p.contains("msapplication")) {
+        // Windows/Chrome User-Agent
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+    }
+    // Default to Windows/Chrome for other icons
+    else {
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+    }
+}
+
+// Use the validation functions from the validation module
+use crate::validation::validate_icon;
+
+/// Try additional common icon locations that might not be explicitly referenced
+async fn try_additional_icon_sources(
+    client: &reqwest::Client,
+    url: &Url,
+    forwarded_headers: Option<&HashMap<String, String>>
+) -> Vec<Icon> {
+    debug!("Trying additional icon sources for URL: {}", url);
+    let mut additional_icons = Vec::new();
+    
+    // Common icon paths to try
+    let common_paths = [
+        // Root favicon variations
+        "/favicon.png",
+        "/favicon-32x32.png",
+        "/favicon-16x16.png",
+        "/favicon-96x96.png",
+        "/favicon-128.png",
+        "/favicon-196x196.png",
+        
+        // Apple icon variations
+        "/apple-icon.png",
+        "/apple-icon-57x57.png",
+        "/apple-icon-60x60.png",
+        "/apple-icon-72x72.png",
+        "/apple-icon-76x76.png",
+        "/apple-icon-114x114.png",
+        "/apple-icon-120x120.png",
+        "/apple-icon-144x144.png",
+        "/apple-icon-152x152.png",
+        "/apple-icon-180x180.png",
+        
+        // Android icon variations
+        "/android-icon-192x192.png",
+        "/android-chrome-192x192.png",
+        "/android-chrome-512x512.png",
+        
+        // Microsoft icon variations
+        "/mstile-70x70.png",
+        "/mstile-144x144.png",
+        "/mstile-150x150.png",
+        "/mstile-310x150.png",
+        "/mstile-310x310.png",
+    ];
+    
+    for path in &common_paths {
+        if let Ok(icon_url) = url.join(path) {
+            let icon_str = icon_url.to_string();
+            
+            // Skip if we've already tried this URL
+            if additional_icons.iter().any(|i: &Icon| i.url == icon_str) {
+                continue;
+            }
+            
+            debug!("Trying additional icon path: {}", icon_str);
+            
+            // Determine content type and size from path
+            let (content_type, width, height) = if path.ends_with(".png") {
+                let size = path.split('-').last()
+                    .and_then(|s| s.split('.').next())
+                    .and_then(|s| s.split('x').next())
+                    .and_then(|s| s.parse::<u32>().ok());
+                
+                ("image/png".to_string(), size, size)
+            } else if path.ends_with(".ico") {
+                ("image/x-icon".to_string(), Some(16), Some(16))
+            } else if path.ends_with(".svg") {
+                ("image/svg+xml".to_string(), None, None)
+            } else {
+                ("image/png".to_string(), None, None)
+            };
+            
+            // Create icon and validate it
+            let icon = Icon::new(
+                icon_str,
+                content_type,
+                width,
+                height,
+            );
+            
+            if validate_icon(client, &icon, forwarded_headers).await {
+                additional_icons.push(icon);
+            }
+        }
+    }
+    
+    additional_icons
+}
+
+/// Gets all available icons from a webpage with enhanced detection and validation
 pub async fn get_page_icons(
     client: &reqwest::Client, 
     url: &Url,
     forwarded_headers: Option<&HashMap<String, String>>
 ) -> Vec<Icon> {
+    info!("Fetching icons for URL: {}", url);
     let mut icons = HashSet::new();
+    let mut validated_icons: Vec<Icon> = Vec::new();
     
     // Try direct favicon.ico
     let favicon_url = url.join("/favicon.ico").ok();
@@ -38,16 +159,26 @@ pub async fn get_page_icons(
     let mut manifest_urls = Vec::new();
     
     // Try fetching HTML and parsing link tags
+    // Create a copy of forwarded headers that we can modify
+    let mut headers = match forwarded_headers {
+        Some(h) => h.clone(),
+        None => HashMap::new(),
+    };
+    
+    // Use a default desktop User-Agent for the initial HTML request
+    headers.insert("User-Agent".to_string(), 
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36".to_string());
+    
+    debug!("Fetching HTML from URL: {}", url);
     let mut request_builder = client.get(url.as_str());
     
-    // Apply forwarded headers if provided
-    if let Some(headers) = forwarded_headers {
-        for (name, value) in headers {
-            request_builder = request_builder.header(name, value);
-        }
+    // Apply headers
+    for (name, value) in &headers {
+        request_builder = request_builder.header(name, value);
     }
     
     if let Ok(response) = request_builder.send().await {
+        debug!("Successfully fetched HTML from URL: {}, status: {}", url, response.status());
         if let Ok(text) = response.text().await {
             let document = Html::parse_document(&text);
             
@@ -190,17 +321,28 @@ pub async fn get_page_icons(
     }
     
     // Process manifest files
-    for manifest_url in manifest_urls {
+    for manifest_url in &manifest_urls {
+        debug!("Fetching web app manifest from URL: {}", manifest_url);
+        
+        // Create a copy of forwarded headers that we can modify
+        let mut manifest_headers = match forwarded_headers {
+            Some(h) => h.clone(),
+            None => HashMap::new(),
+        };
+        
+        // Use a Chrome/Android User-Agent for manifest requests as they're often used for PWAs
+        manifest_headers.insert("User-Agent".to_string(), 
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36".to_string());
+        
         let mut manifest_req = client.get(manifest_url.as_str());
         
-        // Apply forwarded headers to manifest requests too
-        if let Some(headers) = forwarded_headers {
-            for (name, value) in headers {
-                manifest_req = manifest_req.header(name, value);
-            }
+        // Apply headers
+        for (name, value) in &manifest_headers {
+            manifest_req = manifest_req.header(name, value);
         }
         
         if let Ok(manifest_response) = manifest_req.send().await {
+            debug!("Successfully fetched manifest from URL: {}, status: {}", manifest_url, manifest_response.status());
             if let Ok(manifest_text) = manifest_response.text().await {
                 if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest_text) {
                     if let Some(manifest_icons) = manifest.get("icons").and_then(|i| i.as_array()) {
@@ -258,8 +400,10 @@ pub async fn get_page_icons(
         }
     }
     
-    // Calculate scores and sort icons
+    // Validate all collected icons
     let mut icon_vec: Vec<Icon> = icons.into_iter().collect();
+    
+    // Calculate scores for all icons
     for icon in &mut icon_vec {
         icon.calculate_score();
     }
@@ -267,6 +411,59 @@ pub async fn get_page_icons(
     // Sort by score (highest first)
     icon_vec.sort_by(|a, b| b.score.cmp(&a.score));
     
+    // Validate the top icons (up to 5) to avoid excessive requests
+    debug!("Validating top {} icons from URL: {}", icon_vec.len().min(5), url);
+    for icon in icon_vec.iter().take(5) {
+        debug!("Validating icon: {} (type: {}, size: {}x{})", 
+            icon.url, 
+            icon.content_type,
+            icon.width.unwrap_or(0),
+            icon.height.unwrap_or(0));
+            
+        if validate_icon(client, icon, forwarded_headers).await {
+            debug!("Icon validated successfully: {}", icon.url);
+            validated_icons.push(icon.clone());
+        } else {
+            debug!("Icon validation failed: {}", icon.url);
+        }
+    }
+    
+    // If we found valid icons, return them
+    if !validated_icons.is_empty() {
+        // Sort validated icons by score
+        validated_icons.sort_by(|a, b| b.score.cmp(&a.score));
+        info!("Found {} valid icons for URL: {}", validated_icons.len(), url);
+        debug!("Best icon: {} (type: {}, size: {}x{})", 
+            validated_icons[0].url, 
+            validated_icons[0].content_type,
+            validated_icons[0].width.unwrap_or(0),
+            validated_icons[0].height.unwrap_or(0));
+        return validated_icons;
+    }
+    
+    // If no valid icons found, try additional sources
+    debug!("No valid icons found in primary sources, trying additional sources for URL: {}", url);
+    let additional_icons = try_additional_icon_sources(client, url, forwarded_headers).await;
+    if !additional_icons.is_empty() {
+        let mut result = additional_icons;
+        // Calculate scores for additional icons
+        for icon in &mut result {
+            icon.calculate_score();
+        }
+        // Sort by score
+        result.sort_by(|a, b| b.score.cmp(&a.score));
+        info!("Found {} valid icons from additional sources for URL: {}", result.len(), url);
+        debug!("Best additional icon: {} (type: {}, size: {}x{})", 
+            result[0].url, 
+            result[0].content_type,
+            result[0].width.unwrap_or(0),
+            result[0].height.unwrap_or(0));
+        return result;
+    }
+    
+    // If still no icons found, return the original list (which might have invalid icons)
+    // This allows the handler to attempt to fetch them anyway as a last resort
+    warn!("No valid icons found for URL: {}, returning unvalidated icons as last resort", url);
     icon_vec
 }
 
