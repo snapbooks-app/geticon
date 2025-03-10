@@ -5,6 +5,13 @@ All notable changes to the GetIcon project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.5.1] - 2025-03-10
+
+### Added
+- Support for handling HTML meta refresh redirects when fetching favicons
+
 ## [0.5.0] - 2025-03-08
 
 ### Changed
@@ -22,7 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed HTML page redirects for sites like burgerking.no
 - Improved handling of PNG files with valid signatures but unsupported features
 
-## [Unreleased]
 
 ## [0.4.2] - 2025-03-05
 

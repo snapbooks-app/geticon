@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use crate::models::Icon;
 use std::time::Duration;
 use log::{info, warn, debug, error, trace};
+use scraper::{Html, Selector};
 
 /// Checks if a content type header indicates an image
 pub fn is_image_content_type(content_type: &str) -> bool {
@@ -206,6 +207,28 @@ pub async fn validate_icons(
     
     info!("Validated {}/{} icons successfully", validated_icons.len(), icons.len());
     validated_icons
+}
+
+/// Extracts redirect URL from HTML meta refresh tag if present
+pub fn extract_meta_refresh_url(html_content: &[u8]) -> Option<String> {
+    let html_str = String::from_utf8_lossy(html_content);
+    let document = Html::parse_document(&html_str);
+    
+    // Select meta refresh tags
+    let selector = Selector::parse("meta[http-equiv='refresh']").unwrap();
+    
+    for element in document.select(&selector) {
+        if let Some(content) = element.value().attr("content") {
+            // Parse the content attribute which has format "seconds; url=URL"
+            if let Some(url_part) = content.split(';').nth(1) {
+                if let Some(url) = url_part.trim().strip_prefix("url=") {
+                    return Some(url.trim_matches(|c| c == '\'' || c == '"').to_string());
+                }
+            }
+        }
+    }
+    
+    None
 }
 
 /// Validates image content by checking file signatures and using the image crate

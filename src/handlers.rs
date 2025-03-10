@@ -168,7 +168,7 @@ pub async fn get_favicon_img(
     let forwarded_headers = extract_headers_to_forward(&req);
     
     // If not in cache, fetch icons from the website
-    let icons = match get_page_icons(client.as_ref(), &normalized_url, Some(&forwarded_headers)).await {
+    let icons = match get_page_icons(client.as_ref(), &normalized_url, Some(&forwarded_headers), None).await {
         icons if !icons.is_empty() => icons,
         _ => {
             // Log the failure with more details
@@ -469,7 +469,7 @@ pub async fn get_favicon_json(
     let forwarded_headers = extract_headers_to_forward(&req);
     
     // If not in cache, fetch icons from the website
-    let icons = match get_page_icons(client.as_ref(), &normalized_url, Some(&forwarded_headers)).await {
+    let icons = match get_page_icons(client.as_ref(), &normalized_url, Some(&forwarded_headers), None).await {
         icons if !icons.is_empty() => icons,
         _ => {
             warn!("Failed to find icons for URL: {}", normalized_url);
