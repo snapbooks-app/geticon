@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2025-03-13
+
+### Changed
+- Optimized HTTP client configuration with connection pooling and longer timeouts
+- Improved cache mechanism with 2-hour TTL (up from 1 hour)
+- Enhanced Cache-Control headers with longer max-age values
+
+### Added
+- Implemented dual-layer caching system with main and expired caches
+- Added background refresh mechanism for expired icons
+- Improved user experience by returning expired icons immediately (with 10-minute TTL)
+- Parallel icon validation using futures::stream for improved performance
+- Implemented negative caching to avoid repeated validation of failed URLs
+- Parallelized fetching of additional icon sources
+- Enhanced health check endpoint with detailed cache statistics
+
+### Fixed
+- Fixed performance bottlenecks in the /img endpoint
+- Improved handling of expired cache entries
+
 ## [0.5.1] - 2025-03-10
 
 ### Added

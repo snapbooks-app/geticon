@@ -4,8 +4,9 @@ use std::collections::{HashSet, HashMap};
 use url::Url;
 use crate::models::Icon;
 use crate::validation;
-use std::time::Duration;
-use log::{info, warn, debug, error, trace};
+// Duration not used, removing it
+use log::{info, warn, debug}; // Remove unused imports
+use futures::{stream, StreamExt};
 
 /// Selects an appropriate User-Agent string based on icon type
 /// User-Agents sourced from https://www.useragents.me (last updated: March 2025)
@@ -36,13 +37,13 @@ pub fn select_user_agent_for_icon(icon: &Icon) -> &'static str {
 use crate::validation::validate_icon;
 
 /// Try additional common icon locations that might not be explicitly referenced
+/// Now uses parallel processing for significant performance improvement
 async fn try_additional_icon_sources(
     client: &reqwest::Client,
     url: &Url,
     forwarded_headers: Option<&HashMap<String, String>>
 ) -> Vec<Icon> {
-    debug!("Trying additional icon sources for URL: {}", url);
-    let mut additional_icons = Vec::new();
+    debug!("Trying additional icon sources in parallel for URL: {}", url);
     
     // Common icon paths to try
     let common_paths = [
@@ -79,16 +80,16 @@ async fn try_additional_icon_sources(
         "/mstile-310x310.png",
     ];
     
+    // Convert paths to possible icon objects
+    let mut potential_icons = Vec::new();
     for path in &common_paths {
         if let Ok(icon_url) = url.join(path) {
             let icon_str = icon_url.to_string();
             
-            // Skip if we've already tried this URL
-            if additional_icons.iter().any(|i: &Icon| i.url == icon_str) {
+            // Skip duplicate URLs
+            if potential_icons.iter().any(|i: &Icon| i.url == icon_str) {
                 continue;
             }
-            
-            debug!("Trying additional icon path: {}", icon_str);
             
             // Determine content type and size from path
             let (content_type, width, height) = if path.ends_with(".png") {
@@ -106,7 +107,7 @@ async fn try_additional_icon_sources(
                 ("image/png".to_string(), None, None)
             };
             
-            // Create icon and validate it
+            // Create icon and add to potential icons
             let icon = Icon::new(
                 icon_str,
                 content_type,
@@ -114,12 +115,40 @@ async fn try_additional_icon_sources(
                 height,
             );
             
-            if validate_icon(client, &icon, forwarded_headers).await {
-                additional_icons.push(icon);
-            }
+            potential_icons.push(icon);
         }
     }
     
+    // Define the maximum number of concurrent validation tasks
+    const MAX_CONCURRENT_VALIDATIONS: usize = 5;
+    
+    // Validate all possible icons in parallel
+    debug!("Validating {} potential additional icons in parallel", potential_icons.len());
+    
+    let additional_icons: Vec<Icon> = stream::iter(potential_icons)
+        .map(|icon| {
+            let client = client.clone();
+            let headers_opt = forwarded_headers.cloned();
+            
+            async move {
+                debug!("Trying additional icon path: {}", icon.url);
+                if validate_icon(&client, &icon, headers_opt.as_ref()).await {
+                    debug!("Additional icon validated successfully: {}", icon.url);
+                    Some(icon)
+                } else {
+                    debug!("Additional icon validation failed: {}", icon.url);
+                    None
+                }
+            }
+        })
+        .buffer_unordered(MAX_CONCURRENT_VALIDATIONS)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .filter_map(|x| x)
+        .collect();
+    
+    debug!("Found {} valid additional icons", additional_icons.len());
     additional_icons
 }
 

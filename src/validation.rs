@@ -3,8 +3,9 @@ use reqwest;
 use std::collections::HashMap;
 use crate::models::Icon;
 use std::time::Duration;
-use log::{info, warn, debug, error, trace};
+use log::{info, debug};
 use scraper::{Html, Selector};
+use futures::{stream, StreamExt};
 
 /// Checks if a content type header indicates an image
 pub fn is_image_content_type(content_type: &str) -> bool {
@@ -182,28 +183,51 @@ async fn peek_content_is_valid_image(
 
 /// Validates a list of icons by checking if they exist and are valid images
 /// Returns a list of validated icons
+/// Now uses parallel processing for significant performance improvement
 pub async fn validate_icons(
     client: &reqwest::Client,
     icons: &[Icon],
     forwarded_headers: &HashMap<String, String>
 ) -> Vec<Icon> {
-    debug!("Validating {} icons", icons.len());
-    let mut validated_icons = Vec::new();
+    debug!("Validating {} icons in parallel", icons.len());
     
-    for icon in icons {
-        debug!("Validating icon: {} (type: {}, size: {}x{})", 
-            icon.url, 
-            icon.content_type,
-            icon.width.unwrap_or(0),
-            icon.height.unwrap_or(0));
+    // Clone icons for concurrent validation
+    let icons_to_validate: Vec<_> = icons.to_vec();
+    
+    // Define the maximum number of concurrent validation tasks
+    // This controls how many simultaneous HTTP requests we make
+    const MAX_CONCURRENT_VALIDATIONS: usize = 5;
+    
+    // Validate icons in parallel using stream
+    let validated_icons: Vec<Icon> = stream::iter(icons_to_validate)
+        .map(|icon| {
+            let client = client.clone();
+            let headers = forwarded_headers.clone();
             
-        if validate_icon(client, icon, Some(forwarded_headers)).await {
-            debug!("Icon validated successfully: {}", icon.url);
-            validated_icons.push(icon.clone());
-        } else {
-            debug!("Icon validation failed: {}", icon.url);
-        }
-    }
+            async move {
+                debug!("Validating icon: {} (type: {}, size: {}x{})", 
+                    icon.url, 
+                    icon.content_type,
+                    icon.width.unwrap_or(0),
+                    icon.height.unwrap_or(0));
+                
+                let is_valid = validate_icon(&client, &icon, Some(&headers)).await;
+                
+                if is_valid {
+                    debug!("Icon validated successfully: {}", icon.url);
+                    Some(icon)
+                } else {
+                    debug!("Icon validation failed: {}", icon.url);
+                    None
+                }
+            }
+        })
+        .buffer_unordered(MAX_CONCURRENT_VALIDATIONS) // Process up to MAX_CONCURRENT_VALIDATIONS at a time
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .filter_map(|x| x) // Keep only the valid icons (filter_map on the result, not the future)
+        .collect();
     
     info!("Validated {}/{} icons successfully", validated_icons.len(), icons.len());
     validated_icons

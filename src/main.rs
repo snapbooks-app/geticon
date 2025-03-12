@@ -3,7 +3,8 @@ use geticon::handlers::{home, get_favicon_img, get_favicon_json, health_check};
 use geticon::cache::create_default_icon_cache;
 use std::env;
 use std::sync::Arc;
-use log::{info, warn, debug};
+use std::time::Duration;
+use log::{info, debug};
 use env_logger::Env;
 
 #[actix_web::main]
@@ -39,13 +40,17 @@ async fn main() -> std::io::Result<()> {
 
     info!("GetIcon server running at http://0.0.0.0:8080");
     
-    // Create a client with disabled certificate validation
+    // Create a client with optimized configuration for better performance
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(10))              // Reasonable timeout
+        .pool_max_idle_per_host(10)                    // Keep more connections per host
+        .pool_idle_timeout(Duration::from_secs(30))    // Longer connection reuse
+        // rustls-tls feature is already enabled in Cargo.toml
         .build()
         .expect("Failed to build reqwest client");
     
-    debug!("Created HTTP client with certificate validation disabled");
+    debug!("Created optimized HTTP client with connection pooling");
     
     // Create icon cache
     let icon_cache = Arc::new(create_default_icon_cache());

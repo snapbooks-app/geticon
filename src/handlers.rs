@@ -1,16 +1,16 @@
 use actix_web::{get, web, HttpResponse, HttpRequest, http::header};
 use md5;
 use crate::url_utils::normalize_url;
-use crate::models::{IconResponse, Icon};
+use crate::models::IconResponse;
 use crate::favicon::{get_page_icons, find_best_icon_for_size, select_user_agent_for_icon};
-use crate::validation::{validate_icons, validate_image_content, is_html_content, is_image_content_type};
+use crate::validation::{validate_icons, validate_image_content, is_html_content};
 use crate::cache::IconCache;
 use std::env;
 use std::sync::Arc;
-use std::time::Duration;
+// Remove unused Duration import
 use bytes::Bytes;
 use std::collections::HashMap;
-use log::{info, warn, debug, error, trace};
+use log::{warn, debug, error};
 
 /// Home page handler with documentation
 #[get("/")]
@@ -147,21 +147,161 @@ pub async fn get_favicon_img(
         None => normalized_url.to_string(),
     };
     
-    // Check if the icon is in the cache
-    if let Some(cached_entry) = cache.get(&cache_key).await {
-        // Check if the client has the same version (ETag)
-        if let Some(if_none_match) = req.headers().get(header::IF_NONE_MATCH) {
-            if if_none_match.to_str().unwrap_or("") == cached_entry.etag {
-                return HttpResponse::NotModified().finish();
+    // Check if the icon is in the cache (either main or expired)
+    match cache.get(&cache_key).await {
+        Some((cached_entry, needs_refresh)) => {
+            // Check if the client has the same version (ETag)
+            if let Some(if_none_match) = req.headers().get(header::IF_NONE_MATCH) {
+                if if_none_match.to_str().unwrap_or("") == cached_entry.etag {
+                    debug!("Client already has latest version (ETag match): {}", cache_key);
+                    return HttpResponse::NotModified()
+                        .append_header((header::CACHE_CONTROL, "public, max-age=7200"))
+                        .finish();
+                }
             }
+            
+            // If from expired cache, trigger background refresh and return shorter TTL
+            if needs_refresh {
+                debug!("Serving from expired cache while refreshing: {}", cache_key);
+                
+                // Extract headers to forward for the background task
+                let forwarded_headers = extract_headers_to_forward(&req);
+                
+                // Clone variables for background task
+                let cache_clone = cache.clone();
+                let cache_key_clone = cache_key.clone();
+                let client_clone = client.clone();
+                let normalized_url_clone = normalized_url.clone();
+                let forwarded_headers_clone = forwarded_headers.clone();
+                let requested_size_clone = requested_size;
+                
+                // Launch background task to refresh the entry
+                actix_web::rt::spawn(async move {
+                    debug!("Background refresh task started for: {}", cache_key_clone);
+                    
+                    // Fetch icons from website
+                    let icons = match get_page_icons(
+                        client_clone.as_ref(), 
+                        &normalized_url_clone, 
+                        Some(&forwarded_headers_clone), 
+                        None
+                    ).await {
+                        icons if !icons.is_empty() => icons,
+                        _ => {
+                            debug!("Background refresh: no icons found");
+                            return;
+                        }
+                    };
+                    
+                    // Validate icons
+                    let validated_icons = validate_icons(
+                        client_clone.as_ref(), 
+                        &icons, 
+                        &forwarded_headers_clone
+                    ).await;
+                    
+                    if validated_icons.is_empty() {
+                        debug!("Background refresh: no valid icons found");
+                        return;
+                    }
+                    
+                    // Select best icon
+                    let best_icon = match find_best_icon_for_size(&validated_icons, requested_size_clone) {
+                        Some(icon) => icon,
+                        None => {
+                            debug!("Background refresh: no suitable icon found");
+                            return;
+                        }
+                    };
+                    
+                    // Create a copy of forwarded headers that we can modify
+                    let mut headers = forwarded_headers_clone.clone();
+                    
+                    // Override the User-Agent with our selected one based on icon type
+                    headers.insert("User-Agent".to_string(), select_user_agent_for_icon(best_icon).to_string());
+                    
+                    // Fetch the icon
+                    let mut request_builder = client_clone.get(&best_icon.url);
+                    
+                    // Apply headers
+                    for (name, value) in &headers {
+                        request_builder = request_builder.header(name, value);
+                    }
+                    
+                    // Send the request
+                    match request_builder.send().await {
+                        Ok(response) => {
+                            // Verify response is valid
+                            if !response.status().is_success() {
+                                debug!("Background refresh: icon request failed with status {}", response.status());
+                                return;
+                            }
+                            
+                            match response.bytes().await {
+                                Ok(bytes) => {
+                                    // Validate content
+                                    if bytes.is_empty() || is_html_content(&bytes) {
+                                        debug!("Background refresh: invalid icon content");
+                                        return;
+                                    }
+                                    
+                                    let is_valid_image = validate_image_content(&bytes, &best_icon.content_type);
+                                    if !is_valid_image {
+                                        debug!("Background refresh: invalid image content");
+                                        return;
+                                    }
+                                    
+                                    let etag = format!("\"{:x}\"", md5::compute(&bytes));
+                                    
+                                    // Update main cache with the new content
+                                    cache_clone.insert(
+                                        cache_key_clone.clone(), // Clone since we need to use key again
+                                        bytes,
+                                        best_icon.content_type.clone(),
+                                        etag
+                                    ).await;
+                                    
+                                    // Remove from expired cache since it's now in main cache
+                                    cache_clone.remove_from_expired(&cache_key_clone).await;
+                                    
+                                    debug!("Background refresh completed successfully");
+                                },
+                                Err(err) => {
+                                    debug!("Background refresh: Failed to read icon content: {}", err);
+                                }
+                            }
+                        },
+                        Err(err) => {
+                            debug!("Background refresh: Failed to fetch icon: {}", err);
+                        }
+                    }
+                });
+                
+                // Return the expired cached icon with a shorter cache duration (10 minutes)
+                return HttpResponse::Ok()
+                    .content_type(cached_entry.content_type.as_str())
+                    .append_header((header::CACHE_CONTROL, "public, max-age=600")) // 10 minutes
+                    .append_header((header::ETAG, cached_entry.etag.clone()))
+                    .body(cached_entry.content.clone());
+            }
+            
+            // If from main cache, return normal TTL
+            debug!("Serving from main cache: {}", cache_key);
+            return HttpResponse::Ok()
+                .content_type(cached_entry.content_type.as_str())
+                .append_header((header::CACHE_CONTROL, "public, max-age=7200"))
+                .append_header((header::ETAG, cached_entry.etag.clone()))
+                .body(cached_entry.content.clone());
+        },
+        None => {
+            // No cache hit in either main or expired cache
         }
-        
-        // Return the cached icon
-        return HttpResponse::Ok()
-            .content_type(cached_entry.content_type.as_str())
-            .append_header((header::CACHE_CONTROL, "public, max-age=3600"))
-            .append_header((header::ETAG, cached_entry.etag.clone()))
-            .body(cached_entry.content.clone());
+    }
+    
+    // Check if this URL is in the negative cache (previously failed)
+    if cache.is_negative(&cache_key).await {
+        debug!("URL in negative cache, returning 404: {}", cache_key);
+        return HttpResponse::NotFound().body("Icon not found (cached negative result)");
     }
     
     // Extract headers to forward
@@ -188,8 +328,12 @@ pub async fn get_favicon_img(
     // Validate icons
     let validated_icons = validate_icons(client.as_ref(), &icons, &forwarded_headers).await;
     
-    // If no icons passed validation, return a 404
+    // If no icons passed validation, add to negative cache and return a 404
     if validated_icons.is_empty() {
+        // Add to negative cache to avoid repeated validation attempts
+        let cache_key_for_log = cache_key.clone(); // Clone for logging
+        cache.insert_negative(cache_key).await;
+        debug!("No valid icons found, added to negative cache: {}", cache_key_for_log);
         return HttpResponse::NotFound().body("No valid icons found");
     }
     
@@ -338,13 +482,16 @@ pub async fn get_favicon_img(
                             }
                         }
                         
-                        // Store in cache
+                        // Store in main cache, and if it was in expired cache, remove it from there
                         cache.insert(
-                            cache_key,
+                            cache_key.clone(), // Clone since we need the key again
                             bytes.clone(),
                             best_icon.content_type.clone(),
                             etag.clone()
                         ).await;
+                        
+                        // Also check if we should remove it from expired cache
+                        cache.remove_from_expired(&cache_key).await;
 
                         HttpResponse::Ok()
                             .content_type(best_icon.content_type.as_str())
@@ -418,12 +565,27 @@ pub async fn get_favicon_img(
 
 /// Health check endpoint
 #[get("/health")]
-pub async fn health_check() -> HttpResponse {
-    debug!("Health check requested");
-    HttpResponse::Ok()
-        .content_type("application/json")
-        .body(r#"{"status":"ok","service":"geticon"}"#)
-}
+    pub async fn health_check(cache: web::Data<Arc<IconCache>>) -> HttpResponse {
+        debug!("Health check requested");
+        
+        // Get cache statistics for monitoring
+        let (main_count, expired_count, negative_count) = cache.stats().await;
+        
+        HttpResponse::Ok()
+            .content_type("application/json")
+            .body(format!(
+                r#"{{
+                    "status":"ok",
+                    "service":"geticon",
+                    "cache_stats":{{
+                        "main_cache":{},
+                        "expired_cache":{},
+                        "negative_cache":{}
+                    }}
+                }}"#,
+                main_count, expired_count, negative_count
+            ))
+    }
 
 /// Handler for /json endpoint - returns favicon information as JSON
 #[get("/json")]
@@ -456,11 +618,15 @@ pub async fn get_favicon_json(
     };
     
     // Check if the response is in the cache
-    if let Some(cached_entry) = cache.get(&cache_key).await {
+    if let Some((cached_entry, needs_refresh)) = cache.get(&cache_key).await {
+        // For JSON endpoint, we'll use the same approach as for images
+        // If from expired cache, return a shorter TTL
+        let max_age = if needs_refresh { "600" } else { "3600" };
+        
         // Return the cached JSON response
         return HttpResponse::Ok()
             .content_type(cached_entry.content_type.as_str())
-            .append_header((header::CACHE_CONTROL, "public, max-age=3600"))
+            .append_header((header::CACHE_CONTROL, format!("public, max-age={}", max_age)))
             .append_header((header::ETAG, cached_entry.etag.clone()))
             .body(cached_entry.content.clone());
     }
