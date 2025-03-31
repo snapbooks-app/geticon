@@ -36,12 +36,12 @@ The server will start at `http://localhost:8080`
 
 1. Pull the Docker image:
 ```bash
-docker pull ghcr.io/yourusername/geticon:latest
+docker pull ghcr.io/snapbooks-app/geticon:latest
 ```
 
 2. Run the container:
 ```bash
-docker run -p 8080:8080 ghcr.io/yourusername/geticon:latest
+docker run -p 8080:8080 ghcr.io/snapbooks-app/geticon:latest
 ```
 
 Or use Docker Compose:
@@ -51,7 +51,7 @@ Or use Docker Compose:
 version: '3'
 services:
   geticon:
-    image: ghcr.io/yourusername/geticon:latest
+    image: ghcr.io/snapbooks-app/geticon:latest
     ports:
       - "8080:8080"
     environment:
@@ -66,6 +66,8 @@ docker-compose up -d
 ```
 
 ## Usage
+
+GetIcon is in production use at [snapbooks.no](https://snapbooks.no).
 
 ### API Endpoints
 
