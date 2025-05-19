@@ -63,6 +63,12 @@ impl IconCache {
         // Then check the main cache
         if let Some(entry) = self.main_cache.get(key).await {
             debug!("Main cache hit for key: {}", key);
+            let count = {
+                let mut entry_ref = Arc::get_mut(&mut entry.clone()).unwrap();
+                entry_ref.access_count += 1;
+                entry_ref.access_count
+            };
+            debug!("Incremented access count to {} for key: {}", count, key);
             return Some((entry, false)); // false = doesn't need refresh
         }
         
