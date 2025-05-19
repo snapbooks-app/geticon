@@ -63,6 +63,17 @@ impl IconCache {
         // Then check the main cache
         if let Some(entry) = self.main_cache.get(key).await {
             debug!("Main cache hit for key: {}", key);
+            // We can't modify the Arc directly, so we'll create a new entry with incremented access_count
+            let new_entry = Arc::new(CacheEntry {
+                content: entry.content.clone(),
+                content_type: entry.content_type.clone(),
+                etag: entry.etag.clone(),
+                access_count: entry.access_count + 1,
+            });
+            
+            self.main_cache.insert(key.to_string(), new_entry.clone()).await;
+            
+            debug!("Incremented access count to {} for key: {}", new_entry.access_count, key);
             return Some((entry, false)); // false = doesn't need refresh
         }
         

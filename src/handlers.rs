@@ -495,7 +495,7 @@ pub async fn get_favicon_img(
 
                         HttpResponse::Ok()
                             .content_type(best_icon.content_type.as_str())
-                            .append_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                            .append_header((header::CACHE_CONTROL, "public, max-age=7200"))
                             .append_header((header::ETAG, etag))
                             .body(bytes)
                     },
@@ -685,7 +685,7 @@ pub async fn get_favicon_json(
             
             HttpResponse::Ok()
                 .content_type("application/json")
-                .append_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                .append_header((header::CACHE_CONTROL, "public, max-age=7200"))
                 .append_header((header::ETAG, etag))
                 .body(json)
         },

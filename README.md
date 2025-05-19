@@ -134,10 +134,10 @@ Returns a JSON object with:
 ## Cache Support
 
 GetIcon implements efficient caching through:
-- Server-side in-memory cache with 1-hour TTL
+- Server-side in-memory cache with 2-hour TTL
 - Consistent icon selection for the same URL and size
 - ETag headers for client-side caching
-- Cache-Control headers with a 1-hour max age
+- Cache-Control headers with a 2-hour max age
 - 304 Not Modified responses when content hasn't changed
 
 ## Icon Detection

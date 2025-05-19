@@ -54,7 +54,7 @@ async fn main() -> std::io::Result<()> {
     
     // Create icon cache
     let icon_cache = Arc::new(create_default_icon_cache());
-    debug!("Initialized icon cache with 1-hour TTL");
+    debug!("Initialized icon cache with 2-hour TTL");
     
     // Log middleware status
     if sentry_enabled {
