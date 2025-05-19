@@ -88,21 +88,20 @@ jobs:
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
-        if: ${{ env.SHOULD_PUBLISH == 'true' || github.event_name == 'pull_request' }}
+        if: github.event_name != 'pull_request' && env.SHOULD_PUBLISH == 'true'
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=${{ env.VERSION }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=ref,event=pr
             type=sha
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
-        if: ${{ env.SHOULD_PUBLISH == 'true' || github.event_name == 'pull_request' }}
+        if: github.event_name != 'pull_request' && env.SHOULD_PUBLISH == 'true'
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' && env.SHOULD_PUBLISH == 'true' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
