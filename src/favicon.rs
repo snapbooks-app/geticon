@@ -478,22 +478,16 @@ pub async fn get_page_icons(
         // Sort by score (highest first)
         icon_vec.sort_by(|a, b| b.score.cmp(&a.score));
         
-        // Validate the top icons (up to 5) to avoid excessive requests
-        debug!("Validating top {} icons from URL: {}", icon_vec.len().min(5), current_url);
-        for icon in icon_vec.iter().take(5) {
-            debug!("Validating icon: {} (type: {}, size: {}x{})", 
-                icon.url, 
-                icon.content_type,
-                icon.width.unwrap_or(0),
-                icon.height.unwrap_or(0));
-                
-            if validate_icon(client, icon, forwarded_headers).await {
-                debug!("Icon validated successfully: {}", icon.url);
-                validated_icons.push(icon.clone());
-            } else {
-                debug!("Icon validation failed: {}", icon.url);
-            }
-        }
+        // Validate the top icons (up to 5) in parallel to avoid excessive sequential requests
+        debug!("Validating top {} icons in parallel from URL: {}", icon_vec.len().min(5), current_url);
+        let icons_to_validate: Vec<Icon> = icon_vec.iter().take(5).cloned().collect();
+
+        // Use the parallel validate_icons function for significant performance improvement
+        let headers = forwarded_headers
+            .cloned()
+            .unwrap_or_else(HashMap::new);
+
+        validated_icons = validation::validate_icons(client, &icons_to_validate, &headers).await;
         
         // If we found valid icons, return them
         if !validated_icons.is_empty() {
