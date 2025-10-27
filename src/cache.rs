@@ -37,9 +37,10 @@ impl IconCache {
             .build();
             
         // Negative cache has shorter TTL to allow retrying failed URLs periodically
+        // Using 5 minutes (300 seconds) to allow quick recovery from temporary failures
         let negative_cache = Cache::builder()
             .max_capacity(max_capacity / 2) // Half the size of the main cache
-            .time_to_live(Duration::from_secs(ttl_seconds / 2)) // Half the TTL of the main cache 
+            .time_to_live(Duration::from_secs(300)) // 5 minutes for quick recovery
             .build();
             
         IconCache { 
@@ -132,6 +133,13 @@ impl IconCache {
     /// Check if a URL is in the negative cache
     pub async fn is_negative(&self, key: &str) -> bool {
         self.negative_cache.get(key).await.is_some()
+    }
+
+    /// Remove an entry from the negative cache
+    /// Called after successfully fetching and caching an icon
+    pub async fn remove_from_negative(&self, key: &str) {
+        debug!("Removing from negative cache: {}", key);
+        self.negative_cache.invalidate(key).await;
     }
     
     /// Get cache statistics

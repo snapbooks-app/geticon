@@ -260,9 +260,10 @@ pub async fn get_favicon_img(
                                         best_icon.content_type.clone(),
                                         etag
                                     ).await;
-                                    
-                                    // Remove from expired cache since it's now in main cache
+
+                                    // Remove from expired cache and negative cache since we now have a valid icon
                                     cache_clone.remove_from_expired(&cache_key_clone).await;
+                                    cache_clone.remove_from_negative(&cache_key_clone).await;
                                     
                                     debug!("Background refresh completed successfully");
                                 },
@@ -489,9 +490,10 @@ pub async fn get_favicon_img(
                             best_icon.content_type.clone(),
                             etag.clone()
                         ).await;
-                        
-                        // Also check if we should remove it from expired cache
+
+                        // Remove from expired cache and negative cache since we now have a valid icon
                         cache.remove_from_expired(&cache_key).await;
+                        cache.remove_from_negative(&cache_key).await;
 
                         HttpResponse::Ok()
                             .content_type(best_icon.content_type.as_str())
