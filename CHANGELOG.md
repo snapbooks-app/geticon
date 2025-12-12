@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2025-12-12
+
+### Fixed
+- Penalize og:image in icon scoring to prefer actual favicons over page thumbnails
+
 ## [0.6.1] - 2025-12-12
 
 ### Fixed

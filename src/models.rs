@@ -68,7 +68,9 @@ impl Icon {
         // Score based on purpose
         if let Some(purpose) = &self.purpose {
             if purpose.contains("maskable") { score += 10; } // Good for Android adaptive icons
+            if purpose.contains("apple-touch-icon") { score += 15; } // Apple icons are high quality, typically 180x180
             if purpose.contains("any") { score += 5; }
+            if purpose.contains("og:image") { score -= 25; } // Penalize OG images - they're fallback only
         }
         
         self.score = score;
