@@ -222,6 +222,8 @@ pub async fn get_page_icons(
         }
         
         if let Ok(response) = request_builder.send().await {
+            // Update current_url to the final URL after following any HTTP redirects
+            current_url = response.url().clone();
             debug!("Successfully fetched HTML from URL: {}, status: {}", current_url, response.status());
             if let Ok(text) = response.text().await {
                 // Check for meta refresh redirect
