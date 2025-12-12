@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2025-12-12
+
+### Fixed
+- Fixed icon resolution for sites with HTTP redirects to different domains
+
 ## [0.6.0] - 2025-03-13
 
 ### Changed
