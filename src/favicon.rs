@@ -196,7 +196,7 @@ pub async fn get_page_icons(
                     "image/png".to_string(),
                     Some(180),
                     Some(180),
-                ).with_purpose(Some("apple-touch-icon".to_string())));
+                ).with_purpose(Some("apple-touch-icon".to_string())).speculative());
             }
         }
         

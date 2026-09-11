@@ -12,6 +12,8 @@ pub struct Icon {
     pub purpose: Option<String>,
     #[serde(skip)]
     pub score: u32,
+    #[serde(skip)]
+    pub speculative: bool,
 }
 
 impl Icon {
@@ -28,16 +30,23 @@ impl Icon {
             height,
             purpose: None,
             score: 0,
+            speculative: false,
         }
     }
-    
+
     pub fn with_purpose(mut self, purpose: Option<String>) -> Self {
         self.purpose = purpose;
         self
     }
-    
+
+    // Marks an icon whose URL was guessed rather than declared by the site
+    pub fn speculative(mut self) -> Self {
+        self.speculative = true;
+        self
+    }
+
     pub fn calculate_score(&mut self) {
-        let mut score = 0;
+        let mut score: u32 = 0;
         
         // Score based on format quality
         match self.content_type.as_str() {
@@ -68,9 +77,10 @@ impl Icon {
         // Score based on purpose
         if let Some(purpose) = &self.purpose {
             if purpose.contains("maskable") { score += 10; } // Good for Android adaptive icons
-            if purpose.contains("apple-touch-icon") { score += 15; } // Apple icons are high quality, typically 180x180
+            // Apple icons are high quality, typically 180x180 - but only boost ones the site declares
+            if purpose.contains("apple-touch-icon") && !self.speculative { score += 15; }
             if purpose.contains("any") { score += 5; }
-            if purpose.contains("og:image") { score -= 25; } // Penalize OG images - they're fallback only
+            if purpose.contains("og:image") { score = score.saturating_sub(25); } // Penalize OG images - they're fallback only
         }
         
         self.score = score;

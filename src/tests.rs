@@ -80,6 +80,66 @@ fn test_icon_scoring_and_selection() {
 }
 
 #[test]
+fn test_og_image_penalty_does_not_underflow() {
+    // ICO (20) + unknown size (3) = 23, below the 25-point og:image penalty
+    let mut og_icon = Icon::new(
+        "https://example.com/favicon.ico".to_string(),
+        "image/x-icon".to_string(),
+        None,
+        None,
+    ).with_purpose(Some("icon og:image".to_string()));
+    og_icon.calculate_score();
+    assert_eq!(og_icon.score, 0, "Penalty should floor at 0 instead of wrapping");
+
+    let mut og_image = Icon::new(
+        "https://example.com/og.jpg".to_string(),
+        "image/jpeg".to_string(),
+        None,
+        None,
+    ).with_purpose(Some("og:image".to_string()));
+    og_image.calculate_score();
+
+    let mut favicon = Icon::new(
+        "https://example.com/favicon.ico".to_string(),
+        "image/x-icon".to_string(),
+        Some(16),
+        Some(16),
+    );
+    favicon.calculate_score();
+    assert!(og_image.score < favicon.score, "og:image should rank below a plain favicon.ico");
+}
+
+#[test]
+fn test_guessed_apple_touch_icon_not_boosted() {
+    let mut guessed = Icon::new(
+        "https://example.com/apple-touch-icon.png".to_string(),
+        "image/png".to_string(),
+        Some(180),
+        Some(180),
+    ).with_purpose(Some("apple-touch-icon".to_string())).speculative();
+    guessed.calculate_score();
+
+    let mut declared = Icon::new(
+        "https://example.com/apple-touch-icon.png".to_string(),
+        "image/png".to_string(),
+        Some(180),
+        Some(180),
+    ).with_purpose(Some("apple-touch-icon".to_string()));
+    declared.calculate_score();
+
+    let mut large_png = Icon::new(
+        "https://example.com/icon-512.png".to_string(),
+        "image/png".to_string(),
+        Some(512),
+        Some(512),
+    );
+    large_png.calculate_score();
+
+    assert!(declared.score > guessed.score, "Declared apple-touch-icon should keep its boost");
+    assert!(large_png.score > guessed.score, "A declared 512px icon should beat a guessed apple-touch-icon");
+}
+
+#[test]
 fn test_empty_icon_validation() {
     // This test verifies that our content validation logic works correctly
     // by checking that zero-size icons would be rejected
