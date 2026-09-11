@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Fixed og:image penalty wrapping to a huge score (or panicking in debug builds) for icons with a low base score
+- Stopped guessed apple-touch-icon URLs from outranking icons the site actually declares
+
 ## [0.6.2] - 2025-12-12
 
 ### Fixed
