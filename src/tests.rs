@@ -1,9 +1,38 @@
 // Tests for the GetIcon application
+use geticon::cache::IconCache;
 use geticon::models::Icon;
-use geticon::favicon::find_best_icon_for_size;
+use geticon::favicon::{find_best_icon_for_size, get_page_icons};
 use geticon::validation::validate_image_content;
 use std::fs;
+use std::time::{Duration, Instant};
 use bytes::Bytes;
+use url::Url;
+
+#[tokio::test]
+async fn test_cache_reads_do_not_extend_ttl() {
+    let cache = IconCache::new(10, 1);
+    cache.insert("k".to_string(), Bytes::from_static(b"x"), "image/png".to_string(), "\"e\"".to_string()).await;
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(cache.get("k").await.is_some(), "Entry should still be cached before its TTL");
+
+    // This read used to re-insert the entry, pushing its expiry out to 1.6s
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(cache.get("k").await.is_none(), "Reads must not extend the TTL");
+}
+
+#[tokio::test]
+async fn test_unreachable_host_returns_no_icons() {
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    // Nothing listens on port 1, so the HTML fetch fails to connect
+    let url = Url::parse("https://127.0.0.1:1/").unwrap();
+
+    let started = Instant::now();
+    let icons = get_page_icons(&client, &url, None, None).await;
+
+    assert!(icons.is_empty(), "Unvalidated guesses must not be returned as icons");
+    assert!(started.elapsed() < Duration::from_secs(2), "Should give up without probing other paths");
+}
 
 #[test]
 fn test_icon_scoring_and_selection() {

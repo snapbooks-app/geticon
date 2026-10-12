@@ -1,16 +1,20 @@
 use actix_web::{get, web, HttpResponse, HttpRequest, http::header};
 use md5;
 use crate::url_utils::normalize_url;
-use crate::models::IconResponse;
+use crate::models::{Icon, IconResponse};
 use crate::favicon::{get_page_icons, find_best_icon_for_size, select_user_agent_for_icon};
-use crate::validation::{validate_icons, validate_image_content, is_html_content};
+use crate::validation::{validate_image_content, is_html_content};
 use crate::cache::IconCache;
 use std::env;
 use std::sync::Arc;
-// Remove unused Duration import
+use std::time::Duration;
 use bytes::Bytes;
 use std::collections::HashMap;
 use log::{warn, debug, error};
+use url::Url;
+
+/// Upper bound on icon discovery for one request, however many candidate URLs it probes
+const DISCOVERY_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Home page handler with documentation
 #[get("/")]
@@ -115,7 +119,21 @@ fn extract_headers_to_forward(req: &HttpRequest) -> HashMap<String, String> {
     headers
 }
 
-// Use the validate_icons function from the validation module
+/// Runs icon discovery under DISCOVERY_DEADLINE; None means it ran out of time
+async fn discover_icons(
+    client: &reqwest::Client,
+    url: &Url,
+    forwarded_headers: &HashMap<String, String>,
+) -> Option<Vec<Icon>> {
+    let discovery = get_page_icons(client, url, Some(forwarded_headers), None);
+    match actix_web::rt::time::timeout(DISCOVERY_DEADLINE, discovery).await {
+        Ok(icons) => Some(icons),
+        Err(_) => {
+            warn!("Icon discovery timed out after {}s for URL: {}", DISCOVERY_DEADLINE.as_secs(), url);
+            None
+        }
+    }
+}
 
 /// Handler for /img endpoint - returns the best favicon as an image
 #[get("/img")]
@@ -179,32 +197,19 @@ pub async fn get_favicon_img(
                 actix_web::rt::spawn(async move {
                     debug!("Background refresh task started for: {}", cache_key_clone);
                     
-                    // Fetch icons from website
-                    let icons = match get_page_icons(
-                        client_clone.as_ref(), 
-                        &normalized_url_clone, 
-                        Some(&forwarded_headers_clone), 
-                        None
+                    // Fetch icons from website (already validated)
+                    let validated_icons = match discover_icons(
+                        client_clone.as_ref(),
+                        &normalized_url_clone,
+                        &forwarded_headers_clone
                     ).await {
-                        icons if !icons.is_empty() => icons,
+                        Some(icons) if !icons.is_empty() => icons,
                         _ => {
                             debug!("Background refresh: no icons found");
                             return;
                         }
                     };
-                    
-                    // Validate icons
-                    let validated_icons = validate_icons(
-                        client_clone.as_ref(), 
-                        &icons, 
-                        &forwarded_headers_clone
-                    ).await;
-                    
-                    if validated_icons.is_empty() {
-                        debug!("Background refresh: no valid icons found");
-                        return;
-                    }
-                    
+
                     // Select best icon
                     let best_icon = match find_best_icon_for_size(&validated_icons, requested_size_clone) {
                         Some(icon) => icon,
@@ -303,17 +308,36 @@ pub async fn get_favicon_img(
         debug!("URL in negative cache, returning 404: {}", cache_key);
         return HttpResponse::NotFound().body("Icon not found (cached negative result)");
     }
-    
+
+    let response = fetch_icon(&req, &client, &cache, &normalized_url, requested_size, &cache_key).await;
+
+    // Remember every failure so repeat requests skip the whole lookup
+    if response.status().is_client_error() || response.status().is_server_error() {
+        debug!("Adding to negative cache: {}", cache_key);
+        cache.insert_negative(cache_key).await;
+    }
+    response
+}
+
+/// Discovers, fetches and caches the best icon for a URL that missed the cache
+async fn fetch_icon(
+    req: &HttpRequest,
+    client: &reqwest::Client,
+    cache: &IconCache,
+    normalized_url: &Url,
+    requested_size: Option<u32>,
+    cache_key: &str,
+) -> HttpResponse {
     // Extract headers to forward
-    let forwarded_headers = extract_headers_to_forward(&req);
-    
-    // If not in cache, fetch icons from the website
-    let icons = match get_page_icons(client.as_ref(), &normalized_url, Some(&forwarded_headers), None).await {
-        icons if !icons.is_empty() => icons,
-        _ => {
+    let forwarded_headers = extract_headers_to_forward(req);
+
+    // If not in cache, fetch icons from the website (already validated)
+    let validated_icons = match discover_icons(client, normalized_url, &forwarded_headers).await {
+        Some(icons) if !icons.is_empty() => icons,
+        Some(_) => {
             // Log the failure with more details
             warn!("Failed to find icons for URL: {}", normalized_url);
-            
+
             // Also send to Sentry if enabled
             if env::var("SENTRY_DSN").is_ok() {
                 sentry::capture_message(
@@ -323,20 +347,9 @@ pub async fn get_favicon_img(
             }
             return HttpResponse::NotFound().body("No icons found")
         }
+        None => return HttpResponse::GatewayTimeout().body("Timed out looking for icons"),
     };
-    
-    // Validate icons
-    let validated_icons = validate_icons(client.as_ref(), &icons, &forwarded_headers).await;
-    
-    // If no icons passed validation, add to negative cache and return a 404
-    if validated_icons.is_empty() {
-        // Add to negative cache to avoid repeated validation attempts
-        let cache_key_for_log = cache_key.clone(); // Clone for logging
-        cache.insert_negative(cache_key).await;
-        debug!("No valid icons found, added to negative cache: {}", cache_key_for_log);
-        return HttpResponse::NotFound().body("No valid icons found");
-    }
-    
+
     // Select the best icon based on requested size or highest score from validated icons
     let best_icon = match find_best_icon_for_size(&validated_icons, requested_size) {
         Some(icon) => icon,
@@ -474,24 +487,24 @@ pub async fn get_favicon_img(
                         }
                         
                         let etag = format!("\"{:x}\"", md5::compute(&bytes));
-                        
-                        // Check if the client has the same version
+
+                        // Store in main cache, and if it was in expired cache, remove it from there
+                        cache.insert(
+                            cache_key.to_string(),
+                            bytes.clone(),
+                            best_icon.content_type.clone(),
+                            etag.clone()
+                        ).await;
+
+                        // Also check if we should remove it from expired cache
+                        cache.remove_from_expired(cache_key).await;
+
+                        // Check if the client has the same version (after caching, so revalidations warm the cache too)
                         if let Some(if_none_match) = req.headers().get(header::IF_NONE_MATCH) {
                             if if_none_match.to_str().unwrap_or("") == etag {
                                 return HttpResponse::NotModified().finish();
                             }
                         }
-                        
-                        // Store in main cache, and if it was in expired cache, remove it from there
-                        cache.insert(
-                            cache_key.clone(), // Clone since we need the key again
-                            bytes.clone(),
-                            best_icon.content_type.clone(),
-                            etag.clone()
-                        ).await;
-                        
-                        // Also check if we should remove it from expired cache
-                        cache.remove_from_expired(&cache_key).await;
 
                         HttpResponse::Ok()
                             .content_type(best_icon.content_type.as_str())
@@ -630,39 +643,33 @@ pub async fn get_favicon_json(
             .append_header((header::ETAG, cached_entry.etag.clone()))
             .body(cached_entry.content.clone());
     }
-    
+
+    // Check if this URL is in the negative cache (previously failed)
+    if cache.is_negative(&cache_key).await {
+        debug!("URL in negative cache, returning 404: {}", cache_key);
+        return HttpResponse::NotFound().body("No icons found (cached negative result)");
+    }
+
     // Extract headers to forward
     let forwarded_headers = extract_headers_to_forward(&req);
-    
-    // If not in cache, fetch icons from the website
-    let icons = match get_page_icons(client.as_ref(), &normalized_url, Some(&forwarded_headers), None).await {
-        icons if !icons.is_empty() => icons,
-        _ => {
+
+    // If not in cache, fetch icons from the website (already validated)
+    let final_icons = match discover_icons(client.as_ref(), &normalized_url, &forwarded_headers).await {
+        Some(icons) if !icons.is_empty() => icons,
+        Some(_) => {
             warn!("Failed to find icons for URL: {}", normalized_url);
+            cache.insert_negative(cache_key).await;
             return HttpResponse::NotFound().body("No icons found");
         }
+        None => {
+            cache.insert_negative(cache_key).await;
+            return HttpResponse::GatewayTimeout().body("Timed out looking for icons");
+        }
     };
-    
+
     // Select best icon based on requested size or highest score
-    let _best_icon = find_best_icon_for_size(&icons, requested_size)
-        .cloned();
-    
-    // Validate icons
-    let final_icons = validate_icons(client.as_ref(), &icons, &forwarded_headers).await;
-    
-    // If no icons passed validation, return a 404
-    if final_icons.is_empty() {
-        warn!("No valid icons found for URL: {}", normalized_url);
-        return HttpResponse::NotFound().body("No valid icons found");
-    }
-    
-    // Recalculate the best icon based on the validated icons
-    let best_icon = if !final_icons.is_empty() {
-        find_best_icon_for_size(&final_icons, requested_size).cloned()
-    } else {
-        None
-    };
-    
+    let best_icon = find_best_icon_for_size(&final_icons, requested_size).cloned();
+
     // Create response
     let response = IconResponse {
         url: normalized_url.host_str().unwrap_or(url_str).to_string(),

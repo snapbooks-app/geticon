@@ -44,6 +44,7 @@ async fn main() -> std::io::Result<()> {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(10))              // Reasonable timeout
+        .connect_timeout(Duration::from_secs(3))       // TCP + TLS; fail fast on dead hosts
         .pool_max_idle_per_host(10)                    // Keep more connections per host
         .pool_idle_timeout(Duration::from_secs(30))    // Longer connection reuse
         // rustls-tls feature is already enabled in Cargo.toml

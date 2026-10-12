@@ -7,9 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Validate each icon once per request instead of twice; a cold `/img` now makes 8 upstream requests instead of 11
+- Stop icon discovery as soon as a site can't be reached, with a 3-second connect timeout and a 15-second cap on discovery (an unresponsive host fails in 3 seconds instead of 65)
+- Negative-cache every failed lookup, including `/json` and fetch errors on `/img`
+
 ### Fixed
 - Fixed og:image penalty wrapping to a huge score (or panicking in debug builds) for icons with a low base score
 - Stopped guessed apple-touch-icon URLs from outranking icons the site actually declares
+- Cache reads no longer restart an entry's 2-hour TTL, so popular icons get refreshed instead of being served indefinitely
+- A cache miss answered with 304 Not Modified now stores the icon in the server cache
 
 ## [0.6.2] - 2025-12-12
 
