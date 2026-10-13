@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cached failures keep their original status and message, and are retried on the next request once their 1-hour window has passed
 - `/json` sends the same Cache-Control as `/img`: 2 hours, or 10 minutes while a stale entry is being refreshed
 - The health check reports `discovery_cache` and `image_cache` counts instead of `main_cache`, `expired_cache` and `negative_cache`
+- Parse only a page's `<head>`, and only once (a 1.5 MB page went from two full parses, about 80 ms of CPU, to 0.04 ms)
+- Check icons by reading the image header instead of decoding the whole image (a 1200×630 JPEG: 16.6 ms to 0.02 ms)
+- Request gzip, brotli and deflate compression from sites
+- Cap every download, counted after decompression: pages are read up to 1 MB, manifests and browserconfig.xml up to 256 KB, and icons over 2 MB are rejected with "Icon is too large"
+- Bound the image cache at 64 MB instead of 2000 entries of any size
 
 ### Fixed
 - Fixed og:image penalty wrapping to a huge score (or panicking in debug builds) for icons with a low base score

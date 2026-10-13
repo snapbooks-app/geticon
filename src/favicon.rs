@@ -36,6 +36,19 @@ pub fn select_user_agent_for_icon(icon: &Icon) -> &'static str {
 // Use the validation functions from the validation module
 use crate::validation::validate_icon;
 
+/// Most of a page we read; the <head> almost always fits, and longer pages are cut off
+const MAX_PAGE_BYTES: usize = 1024 * 1024;
+/// Largest web app manifest or browserconfig.xml we accept
+const MAX_MANIFEST_BYTES: usize = 256 * 1024;
+
+/// The part of a page up to its </head>, which is where every tag we look for lives
+pub fn html_head(page: &str) -> &str {
+    match page.as_bytes().windows(7).position(|window| window.eq_ignore_ascii_case(b"</head>")) {
+        Some(end) => &page[..end + 7],
+        None => page,
+    }
+}
+
 /// Try additional common icon locations that might not be explicitly referenced
 /// Now uses parallel processing for significant performance improvement
 async fn try_additional_icon_sources(
@@ -235,9 +248,13 @@ pub async fn get_page_icons(
             // Update current_url to the final URL after following any HTTP redirects
             current_url = response.url().clone();
             debug!("Successfully fetched HTML from URL: {}, status: {}", current_url, response.status());
-            if let Ok(text) = response.text().await {
+            if let Ok((body, _)) = validation::read_limited(response, MAX_PAGE_BYTES).await {
+                let text = String::from_utf8_lossy(&body);
+                // Icon, manifest and refresh tags all live in <head>, so the body isn't parsed
+                let document = Html::parse_document(html_head(&text));
+
                 // Check for meta refresh redirect
-                if let Some(redirect_url) = validation::extract_meta_refresh_url(text.as_bytes()) {
+                if let Some(redirect_url) = validation::extract_meta_refresh_url(&document) {
                     debug!("Detected meta refresh redirect to: {}", redirect_url);
                     
                     // Parse the redirect URL
@@ -258,9 +275,7 @@ pub async fn get_page_icons(
                     // Continue to the next iteration of the loop
                     continue;
                 }
-                
-                let document = Html::parse_document(&text);
-                
+
                 // Look for all icon-related link tags
                 let selector = Selector::parse("link[rel~='icon'], link[rel~='shortcut icon'], link[rel~='apple-touch-icon'], link[rel~='apple-touch-icon-precomposed'], link[rel~='mask-icon'], meta[name='msapplication-TileImage']").unwrap();
                 
@@ -348,7 +363,8 @@ pub async fn get_page_icons(
                         if let Ok(config_url) = current_url.join(content) {
                             // Try to fetch browserconfig.xml
                             if let Ok(config_response) = client.get(config_url).send().await {
-                                if let Ok(config_text) = config_response.text().await {
+                                if let Ok((config_body, _)) = validation::read_limited(config_response, MAX_MANIFEST_BYTES).await {
+                                    let config_text = String::from_utf8_lossy(&config_body);
                                     // Very basic parsing of browserconfig.xml
                                     if let Some(tile_image) = config_text.lines()
                                         .find(|line| line.contains("<square"))
@@ -422,8 +438,8 @@ pub async fn get_page_icons(
             
             if let Ok(manifest_response) = manifest_req.send().await {
                 debug!("Successfully fetched manifest from URL: {}, status: {}", manifest_url, manifest_response.status());
-                if let Ok(manifest_text) = manifest_response.text().await {
-                    if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest_text) {
+                if let Ok((manifest_body, false)) = validation::read_limited(manifest_response, MAX_MANIFEST_BYTES).await {
+                    if let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&manifest_body) {
                         if let Some(manifest_icons) = manifest.get("icons").and_then(|i| i.as_array()) {
                             for icon in manifest_icons {
                                 if let (Some(src), Some(sizes)) = (

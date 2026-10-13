@@ -3,7 +3,7 @@ use md5;
 use crate::url_utils::normalize_url;
 use crate::models::{Icon, IconResponse};
 use crate::favicon::{get_page_icons, find_best_icon_for_size, select_user_agent_for_icon};
-use crate::validation::{validate_image_content, is_html_content};
+use crate::validation::{validate_image_content, is_html_content, read_limited};
 use crate::cache::{CacheEntry, CachedImage, Failure, IconCache};
 use std::env;
 use std::sync::Arc;
@@ -14,6 +14,9 @@ use url::Url;
 
 /// Upper bound on icon discovery for one request, however many candidate URLs it probes
 const DISCOVERY_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Largest icon we download and serve
+const MAX_ICON_BYTES: usize = 2 * 1024 * 1024;
 
 /// Home page handler with documentation
 #[get("/")]
@@ -238,8 +241,13 @@ async fn fetch_image(
         ));
     }
 
-    let bytes = match response.bytes().await {
-        Ok(bytes) => bytes,
+    let bytes = match read_limited(response, MAX_ICON_BYTES).await {
+        Ok((bytes, false)) => bytes,
+        Ok((_, true)) => return Err(fail(
+            StatusCode::NOT_FOUND,
+            "Icon is too large",
+            format!("Icon over {} bytes for URL: {} from icon URL: {}", MAX_ICON_BYTES, page_url, icon.url),
+        )),
         Err(err) => return Err(fail(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to read icon content",

@@ -3,8 +3,9 @@ use actix_web::http::StatusCode;
 use futures::future::{FutureExt, LocalBoxFuture};
 use geticon::cache::{Failure, SwrCache};
 use geticon::models::Icon;
-use geticon::favicon::{find_best_icon_for_size, get_page_icons};
-use geticon::validation::validate_image_content;
+use geticon::favicon::{find_best_icon_for_size, get_page_icons, html_head};
+use geticon::validation::{extract_meta_refresh_url, is_html_content, read_limited, validate_image_content};
+use scraper::Html;
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,7 +33,7 @@ fn not_found() -> Failure {
 
 #[actix_rt::test]
 async fn test_concurrent_misses_share_one_load() {
-    let cache = SwrCache::new(10, Duration::from_secs(60), Duration::from_secs(60), Duration::from_secs(600));
+    let cache = SwrCache::new(10, |_| 1, Duration::from_secs(60), Duration::from_secs(60), Duration::from_secs(600));
     let calls = Arc::new(AtomicUsize::new(0));
 
     let requests = (0..10).map(|_| cache.get_or_load("k", counting_loader(&calls, Ok(1), Duration::from_millis(50))));
@@ -44,7 +45,7 @@ async fn test_concurrent_misses_share_one_load() {
 
 #[actix_rt::test]
 async fn test_stale_entry_is_served_while_one_refresh_runs() {
-    let cache = SwrCache::new(10, Duration::from_millis(100), Duration::from_secs(60), Duration::from_secs(600));
+    let cache = SwrCache::new(10, |_| 1, Duration::from_millis(100), Duration::from_secs(60), Duration::from_secs(600));
     let calls = Arc::new(AtomicUsize::new(0));
     cache.get_or_load("k", counting_loader(&calls, Ok(1), Duration::ZERO)).await;
     actix_rt::time::sleep(Duration::from_millis(150)).await;
@@ -65,7 +66,7 @@ async fn test_stale_entry_is_served_while_one_refresh_runs() {
 
 #[actix_rt::test]
 async fn test_failed_refresh_keeps_last_good_value() {
-    let cache = SwrCache::new(10, Duration::from_millis(100), Duration::from_secs(60), Duration::from_secs(600));
+    let cache = SwrCache::new(10, |_| 1, Duration::from_millis(100), Duration::from_secs(60), Duration::from_secs(600));
     let calls = Arc::new(AtomicUsize::new(0));
     cache.get_or_load("k", counting_loader(&calls, Ok(1), Duration::ZERO)).await;
     actix_rt::time::sleep(Duration::from_millis(150)).await;
@@ -81,7 +82,7 @@ async fn test_failed_refresh_keeps_last_good_value() {
 
 #[actix_rt::test]
 async fn test_failures_are_cached_then_retried_inline() {
-    let cache = SwrCache::new(10, Duration::from_secs(60), Duration::from_millis(100), Duration::from_secs(600));
+    let cache = SwrCache::new(10, |_| 1, Duration::from_secs(60), Duration::from_millis(100), Duration::from_secs(600));
     let calls = Arc::new(AtomicUsize::new(0));
 
     let (entry, _) = cache.get_or_load("k", counting_loader(&calls, Err(not_found()), Duration::ZERO)).await;
@@ -301,4 +302,54 @@ fn test_png_validation_with_fallback() {
     
     // The validation should pass due to the fallback mechanism
     assert!(is_valid, "PNG validation should pass for a PNG with valid signature but invalid structure");
+}
+
+#[tokio::test]
+async fn test_read_limited_cuts_off_long_bodies() {
+    let mut server = mockito::Server::new_async().await;
+    server.mock("GET", "/").with_body("0123456789").create_async().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    let response = client.get(server.url()).send().await.unwrap();
+    let (body, truncated) = read_limited(response, 4).await.unwrap();
+    assert_eq!((&body[..], truncated), (&b"0123"[..], true));
+
+    let response = client.get(server.url()).send().await.unwrap();
+    let (body, truncated) = read_limited(response, 10).await.unwrap();
+    assert_eq!((&body[..], truncated), (&b"0123456789"[..], false), "A body exactly at the limit is complete");
+}
+
+#[test]
+fn test_html_head_stops_at_closing_head_tag() {
+    let page = "<html><HEAD><link rel=icon href=/a.png></Head><body><link rel=icon href=/b.png></body></html>";
+    assert_eq!(html_head(page), "<html><HEAD><link rel=icon href=/a.png></Head>");
+    assert_eq!(html_head("<link rel=icon href=/a.png>"), "<link rel=icon href=/a.png>", "No </head> keeps the whole page");
+}
+
+#[test]
+fn test_meta_refresh_found_in_parsed_head() {
+    let document = Html::parse_document("<head><meta http-equiv='refresh' content=\"0; url='/home'\"></head>");
+    assert_eq!(extract_meta_refresh_url(&document), Some("/home".to_string()));
+    assert_eq!(extract_meta_refresh_url(&Html::parse_document("<head></head>")), None);
+}
+
+#[test]
+fn test_image_header_check_rejects_corrupt_jpeg() {
+    let mut jpeg = Vec::new();
+    image::DynamicImage::new_rgb8(4, 4)
+        .write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageOutputFormat::Jpeg(80))
+        .unwrap();
+    assert!(validate_image_content(&Bytes::from(jpeg), "image/jpeg"));
+
+    let corrupt = Bytes::from_static(b"\xFF\xD8\xFFnot really a jpeg at all");
+    assert!(!validate_image_content(&corrupt, "image/jpeg"), "A JPEG signature alone isn't enough");
+}
+
+#[test]
+fn test_html_markers_past_first_kb_are_not_html() {
+    let mut png = fs::read("tests/assets/favicon.png").unwrap();
+    png.resize(4096, 0);
+    png.extend_from_slice(b"<body");
+    assert!(!is_html_content(&png), "Binary data that happens to contain markup later on is not a page");
+    assert!(is_html_content(b"\n\n<html><head><title>Consent</title></head>"));
 }
