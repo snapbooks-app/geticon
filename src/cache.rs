@@ -1,139 +1,162 @@
+use actix_web::http::StatusCode;
 use moka::future::Cache;
+use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use bytes::Bytes;
 use log::{info, debug};
+use crate::models::Icon;
 
-/// Cache for storing fetched icons to avoid repeated requests
-/// Enhanced with dual-layer caching system for handling expired entries
-pub struct IconCache {
-    main_cache: Cache<String, Arc<CacheEntry>>,     // Primary cache with normal TTL
-    expired_cache: Cache<String, Arc<CacheEntry>>,  // Secondary cache for expired entries
-    negative_cache: Cache<String, ()>,              // For URLs that failed validation
+/// Why a lookup produced no icon; cached like a result so repeat requests get the same answer
+#[derive(Clone, Debug)]
+pub struct Failure {
+    pub status: StatusCode,
+    pub message: String,
 }
 
-/// Entry in the icon cache
+/// An icon image ready to serve from /img
 #[derive(Clone)]
-pub struct CacheEntry {
+pub struct CachedImage {
     pub content: Bytes,
     pub content_type: String,
     pub etag: String,
 }
 
-impl IconCache {
-    /// Create a new icon cache with the specified max capacity and TTL
-    pub fn new(max_capacity: u64, ttl_seconds: u64) -> Self {
-        let main_cache = Cache::builder()
-            .max_capacity(max_capacity)
-            .time_to_live(Duration::from_secs(ttl_seconds))
-            .time_to_idle(Duration::from_secs(ttl_seconds * 2)) // Keep frequently accessed items longer
-            .build();
-        
-        // Expired cache has a longer TTL to serve as fallback while refreshing
-        let expired_cache = Cache::builder()
-            .max_capacity(max_capacity) // Same size as main cache
-            .time_to_live(Duration::from_secs(259200)) // 3 days (in seconds)
-            .build();
-            
-        // Negative cache has shorter TTL to allow retrying failed URLs periodically
-        let negative_cache = Cache::builder()
-            .max_capacity(max_capacity / 2) // Half the size of the main cache
-            .time_to_live(Duration::from_secs(ttl_seconds / 2)) // Half the TTL of the main cache 
-            .build();
-            
-        IconCache { 
-            main_cache,
-            expired_cache,
-            negative_cache 
-        }
-    }
-    
-    /// Get an entry from the cache
-    /// Returns (CacheEntry, needs_refresh)
-    /// If needs_refresh is true, the entry came from the expired cache and should be refreshed
-    pub async fn get(&self, key: &str) -> Option<(Arc<CacheEntry>, bool)> {
-        // First check if this key is in the negative cache
-        let in_negative = self.negative_cache.get(key).await.is_some();
-        if in_negative {
-            debug!("Cache hit (negative) for key: {}", key);
-            return None;
-        }
-        
-        // Then check the main cache. Read-only: re-inserting here would restart the TTL
-        if let Some(entry) = self.main_cache.get(key).await {
-            debug!("Main cache hit for key: {}", key);
-            return Some((entry, false)); // false = doesn't need refresh
-        }
-        
-        // Finally check the expired cache
-        if let Some(entry) = self.expired_cache.get(key).await {
-            debug!("Expired cache hit for key: {}", key);
-            return Some((entry, true)); // true = needs refresh
-        }
-        
-        debug!("Cache miss for key: {}", key);
-        None
-    }
-    
-    /// Insert an entry into the main cache
-    pub async fn insert(&self, key: String, content: Bytes, content_type: String, etag: String) {
-        let entry = Arc::new(CacheEntry {
-            content,
-            content_type,
-            etag,
-        });
-        
-        debug!("Inserting into main cache: {}", key);
-        self.main_cache.insert(key, entry).await;
-    }
-    
-    /// Move an entry from main cache to expired cache
-    /// Called when an entry in the main cache expires but we want to keep it for fallback
-    pub async fn move_to_expired(&self, key: String, entry: Arc<CacheEntry>) {
-        debug!("Moving to expired cache: {}", key);
-        self.expired_cache.insert(key, entry).await;
-    }
-    
-    /// Manually move expired entries from main cache to expired cache
-    /// This is used as a workaround for the lack of direct on_evict handler capture support
-    pub async fn check_and_move_expired_entries(&self) {
-        // This would require additional tracking of entry insertion times
-        // which is beyond the scope of the current implementation
-        // In a real implementation, we would iterate through main_cache entries 
-        // and check if they're approaching expiry
-    }
-    
-    /// Remove an entry from the expired cache
-    /// Called after successfully refreshing an entry
-    pub async fn remove_from_expired(&self, key: &str) {
-        debug!("Removing from expired cache: {}", key);
-        self.expired_cache.invalidate(key).await;
-    }
-    
-    /// Insert a negative entry for failed URLs to avoid repeated validation attempts
-    pub async fn insert_negative(&self, key: String) {
-        debug!("Inserting negative cache entry: {}", key);
-        self.negative_cache.insert(key, ()).await;
-    }
-    
-    /// Check if a URL is in the negative cache
-    pub async fn is_negative(&self, key: &str) -> bool {
-        self.negative_cache.get(key).await.is_some()
-    }
-    
-    /// Get cache statistics
-    pub async fn stats(&self) -> (u64, u64, u64) {
-        let main_count = self.main_cache.entry_count();
-        let expired_count = self.expired_cache.entry_count();
-        let negative_count = self.negative_cache.entry_count();
-        (main_count, expired_count, negative_count)
+/// A cached lookup outcome and the window in which it counts as fresh
+pub struct CacheEntry<T> {
+    pub value: Result<T, Failure>,
+    fetched_at: Instant,
+    fresh_until: Instant,
+}
+
+impl<T> CacheEntry<T> {
+    fn new(value: Result<T, Failure>, fresh_for: Duration, failure_fresh_for: Duration) -> Self {
+        let now = Instant::now();
+        let window = if value.is_ok() { fresh_for } else { failure_fresh_for };
+        CacheEntry { value, fetched_at: now, fresh_until: now + window }
     }
 }
 
-/// Create a default icon cache with reasonable defaults
+/// Stale-while-revalidate cache: fresh entries are served as-is, stale successes are served
+/// while one background task refreshes them, and misses share a single load per key
+pub struct SwrCache<T> {
+    entries: Cache<String, Arc<CacheEntry<T>>>,
+    // Keys with a background refresh in flight; the TTL frees a key even if its task dies
+    refreshing: Cache<String, ()>,
+    fresh_for: Duration,
+    failure_fresh_for: Duration,
+    max_age: Duration,
+}
+
+impl<T: Clone + Send + Sync + 'static> SwrCache<T> {
+    /// `fresh_for` applies to successes and `failure_fresh_for` to failures;
+    /// a success is served stale until `max_age` after it was fetched
+    pub fn new(max_capacity: u64, fresh_for: Duration, failure_fresh_for: Duration, max_age: Duration) -> Self {
+        SwrCache {
+            entries: Cache::builder()
+                .max_capacity(max_capacity)
+                .time_to_live(max_age)
+                .build(),
+            refreshing: Cache::builder()
+                .time_to_live(Duration::from_secs(60))
+                .build(),
+            fresh_for,
+            failure_fresh_for,
+            max_age,
+        }
+    }
+
+    /// Returns the entry for `key` and whether it is stale, calling `load` only on a miss,
+    /// on an expired failure, or (in the background) to refresh a stale success
+    pub async fn get_or_load<F, Fut>(&self, key: &str, load: F) -> (Arc<CacheEntry<T>>, bool)
+    where
+        F: FnOnce() -> Fut + 'static,
+        Fut: Future<Output = Result<T, Failure>> + 'static,
+    {
+        let now = Instant::now();
+        if let Some(entry) = self.entries.get(key).await {
+            if now < entry.fresh_until {
+                debug!("Fresh cache hit for key: {}", key);
+                return (entry, false);
+            }
+            // Failures are never served stale: a site that recovered should work on the next request
+            if entry.value.is_ok() && now < entry.fetched_at + self.max_age {
+                debug!("Stale cache hit for key: {}", key);
+                self.refresh_in_background(key, entry.clone(), load).await;
+                return (entry, true);
+            }
+        }
+
+        debug!("Cache miss for key: {}", key);
+        let (fresh_for, failure_fresh_for) = (self.fresh_for, self.failure_fresh_for);
+        let entry = self.entries.entry(key.to_string())
+            .or_insert_with_if(
+                async move { Arc::new(CacheEntry::new(load().await, fresh_for, failure_fresh_for)) },
+                |entry| Instant::now() >= entry.fresh_until,
+            )
+            .await
+            .into_value();
+        (entry, false)
+    }
+
+    async fn refresh_in_background<F, Fut>(&self, key: &str, stale: Arc<CacheEntry<T>>, load: F)
+    where
+        F: FnOnce() -> Fut + 'static,
+        Fut: Future<Output = Result<T, Failure>> + 'static,
+    {
+        if !self.refreshing.entry(key.to_string()).or_insert(()).await.is_fresh() {
+            debug!("Refresh already running for key: {}", key);
+            return;
+        }
+
+        let entries = self.entries.clone();
+        let refreshing = self.refreshing.clone();
+        let key = key.to_string();
+        let (fresh_for, failure_fresh_for) = (self.fresh_for, self.failure_fresh_for);
+        actix_web::rt::spawn(async move {
+            debug!("Background refresh started for key: {}", key);
+            let entry = match load().await {
+                Ok(value) => CacheEntry::new(Ok(value), fresh_for, failure_fresh_for),
+                // Keep serving the last good value and retry once the failure window has passed
+                Err(failure) => {
+                    debug!("Background refresh failed for key {}: {}", key, failure.message);
+                    CacheEntry {
+                        value: stale.value.clone(),
+                        fetched_at: stale.fetched_at,
+                        fresh_until: Instant::now() + failure_fresh_for,
+                    }
+                }
+            };
+            entries.insert(key.clone(), Arc::new(entry)).await;
+            refreshing.invalidate(&key).await;
+        });
+    }
+
+    pub fn entry_count(&self) -> u64 {
+        self.entries.entry_count()
+    }
+}
+
+/// Icon caches shared by all workers
+pub struct IconCache {
+    /// Validated icons per page URL, shared by /img (every size) and /json
+    pub discovery: SwrCache<Vec<Icon>>,
+    /// Image bytes per icon URL
+    pub images: SwrCache<CachedImage>,
+}
+
+/// Fresh for 2 hours (failures 1 hour), served stale for up to 3 days while refreshing
+fn default_swr_cache<T: Clone + Send + Sync + 'static>() -> SwrCache<T> {
+    SwrCache::new(
+        2000,
+        Duration::from_secs(2 * 60 * 60),
+        Duration::from_secs(60 * 60),
+        Duration::from_secs(3 * 24 * 60 * 60),
+    )
+}
+
+/// Create the icon cache with default sizes and freshness windows
 pub fn create_default_icon_cache() -> IconCache {
-    // Default: 2000 entries, 2 hour TTL (increased from 1 hour)
-    let cache = IconCache::new(2000, 7200);
-    info!("Created optimized icon cache with dual-layer caching (2-hour main TTL, 3-day expired TTL)");
-    cache
+    info!("Created icon cache (2-hour freshness, served stale for up to 3 days while refreshing)");
+    IconCache { discovery: default_swr_cache(), images: default_swr_cache() }
 }

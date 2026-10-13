@@ -7,10 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Serve icons for up to 3 days after they go stale while one background task per icon refreshes them; a failed refresh keeps serving the last good icon
+- Concurrent requests for the same uncached page share one lookup (10 simultaneous cold requests: 8 upstream requests instead of 80)
+
 ### Changed
 - Validate each icon once per request instead of twice; a cold `/img` now makes 8 upstream requests instead of 11
 - Stop icon discovery as soon as a site can't be reached, with a 3-second connect timeout and a 15-second cap on discovery (an unresponsive host fails in 3 seconds instead of 65)
 - Negative-cache every failed lookup, including `/json` and fetch errors on `/img`
+- Cache each page's icon lookup once and share it between `/img` (every size) and `/json`; cache downloaded images per icon URL
+- Cached failures keep their original status and message, and are retried on the next request once their 1-hour window has passed
+- `/json` sends the same Cache-Control as `/img`: 2 hours, or 10 minutes while a stale entry is being refreshed
+- The health check reports `discovery_cache` and `image_cache` counts instead of `main_cache`, `expired_cache` and `negative_cache`
 
 ### Fixed
 - Fixed og:image penalty wrapping to a huge score (or panicking in debug builds) for icons with a low base score
