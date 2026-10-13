@@ -6,7 +6,7 @@ use crate::models::Icon;
 use crate::validation;
 // Duration not used, removing it
 use log::{info, warn, debug}; // Remove unused imports
-use futures::{stream, StreamExt};
+use futures::future::join_all;
 
 /// Selects an appropriate User-Agent string based on icon type
 /// User-Agents sourced from https://www.useragents.me (last updated: March 2025)
@@ -33,9 +33,6 @@ pub fn select_user_agent_for_icon(icon: &Icon) -> &'static str {
     }
 }
 
-// Use the validation functions from the validation module
-use crate::validation::validate_icon;
-
 /// Most of a page we read; the <head> almost always fits, and longer pages are cut off
 const MAX_PAGE_BYTES: usize = 1024 * 1024;
 /// Largest web app manifest or browserconfig.xml we accept
@@ -50,7 +47,6 @@ pub fn html_head(page: &str) -> &str {
 }
 
 /// Try additional common icon locations that might not be explicitly referenced
-/// Now uses parallel processing for significant performance improvement
 async fn try_additional_icon_sources(
     client: &reqwest::Client,
     url: &Url,
@@ -58,39 +54,25 @@ async fn try_additional_icon_sources(
 ) -> Vec<Icon> {
     debug!("Trying additional icon sources in parallel for URL: {}", url);
     
-    // Common icon paths to try
+    // Common icon paths to try, most useful first so the search can stop early
     let common_paths = [
-        // Root favicon variations
+        "/apple-icon-180x180.png",
+        "/android-chrome-512x512.png",
+        "/android-chrome-192x192.png",
+        "/android-icon-192x192.png",
+        "/favicon-196x196.png",
+        "/apple-icon.png",
+        "/apple-icon-152x152.png",
+        "/apple-icon-144x144.png",
+        "/mstile-310x310.png",
+        "/mstile-150x150.png",
+        "/mstile-144x144.png",
+        "/apple-icon-120x120.png",
+        "/apple-icon-114x114.png",
+        "/favicon-128.png",
+        "/favicon-96x96.png",
         "/favicon.png",
         "/favicon-32x32.png",
-        "/favicon-16x16.png",
-        "/favicon-96x96.png",
-        "/favicon-128.png",
-        "/favicon-196x196.png",
-        
-        // Apple icon variations
-        "/apple-icon.png",
-        "/apple-icon-57x57.png",
-        "/apple-icon-60x60.png",
-        "/apple-icon-72x72.png",
-        "/apple-icon-76x76.png",
-        "/apple-icon-114x114.png",
-        "/apple-icon-120x120.png",
-        "/apple-icon-144x144.png",
-        "/apple-icon-152x152.png",
-        "/apple-icon-180x180.png",
-        
-        // Android icon variations
-        "/android-icon-192x192.png",
-        "/android-chrome-192x192.png",
-        "/android-chrome-512x512.png",
-        
-        // Microsoft icon variations
-        "/mstile-70x70.png",
-        "/mstile-144x144.png",
-        "/mstile-150x150.png",
-        "/mstile-310x150.png",
-        "/mstile-310x310.png",
     ];
     
     // Convert paths to possible icon objects
@@ -132,37 +114,124 @@ async fn try_additional_icon_sources(
         }
     }
     
-    // Define the maximum number of concurrent validation tasks
-    const MAX_CONCURRENT_VALIDATIONS: usize = 5;
+    // Probe a batch at a time and stop at the first batch that finds anything
+    let headers = forwarded_headers.cloned().unwrap_or_default();
+    for batch in potential_icons.chunks(5) {
+        let found = validation::validate_icons(client, batch, &headers).await;
+        if !found.is_empty() {
+            debug!("Found {} valid additional icons", found.len());
+            return found;
+        }
+    }
+    Vec::new()
+}
+
+/// Icons listed in a web app manifest
+async fn fetch_manifest_icons(
+    client: &reqwest::Client,
+    manifest_url: &Url,
+    forwarded_headers: Option<&HashMap<String, String>>,
+) -> Vec<Icon> {
+    let mut found = Vec::new();
+    debug!("Fetching web app manifest from URL: {}", manifest_url);
     
-    // Validate all possible icons in parallel
-    debug!("Validating {} potential additional icons in parallel", potential_icons.len());
+    // Create a copy of forwarded headers that we can modify
+    let mut manifest_headers = match forwarded_headers {
+        Some(h) => h.clone(),
+        None => HashMap::new(),
+    };
     
-    let additional_icons: Vec<Icon> = stream::iter(potential_icons)
-        .map(|icon| {
-            let client = client.clone();
-            let headers_opt = forwarded_headers.cloned();
-            
-            async move {
-                debug!("Trying additional icon path: {}", icon.url);
-                if validate_icon(&client, &icon, headers_opt.as_ref()).await {
-                    debug!("Additional icon validated successfully: {}", icon.url);
-                    Some(icon)
-                } else {
-                    debug!("Additional icon validation failed: {}", icon.url);
-                    None
+    // Use a Chrome/Android User-Agent for manifest requests as they're often used for PWAs
+    manifest_headers.insert("User-Agent".to_string(),
+        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36".to_string());
+
+    let mut manifest_req = client.get(manifest_url.as_str());
+
+    // Apply headers
+    for (name, value) in &manifest_headers {
+        manifest_req = manifest_req.header(name, value);
+    }
+
+    if let Ok(manifest_response) = manifest_req.send().await {
+        debug!("Successfully fetched manifest from URL: {}, status: {}", manifest_url, manifest_response.status());
+        if let Ok((manifest_body, false)) = validation::read_limited(manifest_response, MAX_MANIFEST_BYTES).await {
+            if let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&manifest_body) {
+                if let Some(manifest_icons) = manifest.get("icons").and_then(|i| i.as_array()) {
+                    for icon in manifest_icons {
+                        if let (Some(src), Some(sizes)) = (
+                            icon.get("src").and_then(|s| s.as_str()),
+                            icon.get("sizes").and_then(|s| s.as_str()),
+                        ) {
+                            if let Ok(icon_url) = manifest_url.join(src) {
+                                // Parse size from manifest
+                                let (width, height) = if sizes.contains('x') {
+                                    let parts: Vec<&str> = sizes.split('x').collect();
+                                    if parts.len() == 2 {
+                                        (parts[0].parse().ok(), parts[1].parse().ok())
+                                    } else {
+                                        (None, None)
+                                    }
+                                } else if let Ok(size) = sizes.parse::<u32>() {
+                                    // Some manifests use single number for square icons
+                                    (Some(size), Some(size))
+                                } else {
+                                    (None, None)
+                                };
+
+                                // Get content type from extension
+                                let content_type = if src.ends_with(".png") {
+                                    "image/png".to_string()
+                                } else if src.ends_with(".svg") {
+                                    "image/svg+xml".to_string()
+                                } else if src.ends_with(".webp") {
+                                    "image/webp".to_string()
+                                } else if src.ends_with(".jpg") || src.ends_with(".jpeg") {
+                                    "image/jpeg".to_string()
+                                } else {
+                                    "image/png".to_string() // Default to PNG
+                                };
+
+                                // Get purpose if available
+                                let purpose = icon.get("purpose")
+                                    .and_then(|p| p.as_str())
+                                    .map(|p| p.to_string());
+
+                                found.push(Icon::new(
+                                    icon_url.to_string(),
+                                    content_type,
+                                    width,
+                                    height,
+                                ).with_purpose(purpose));
+                            }
+                        }
+                    }
                 }
             }
-        })
-        .buffer_unordered(MAX_CONCURRENT_VALIDATIONS)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .filter_map(|x| x)
-        .collect();
-    
-    debug!("Found {} valid additional icons", additional_icons.len());
-    additional_icons
+        }
+    }
+    found
+}
+
+/// The tile image a browserconfig.xml names, resolved against the page URL
+async fn fetch_browserconfig_icon(client: &reqwest::Client, config_url: &Url, page_url: &Url) -> Option<Icon> {
+    let config_response = client.get(config_url.as_str()).send().await.ok()?;
+    let (config_body, _) = validation::read_limited(config_response, MAX_MANIFEST_BYTES).await.ok()?;
+    let config_text = String::from_utf8_lossy(&config_body);
+    // Very basic parsing of browserconfig.xml
+    let tile_image = config_text.lines()
+        .find(|line| line.contains("<square"))
+        .and_then(|line| {
+            let start = line.find("src=\"")?;
+            let end = line[start + 5..].find("\"")?;
+            Some(&line[start + 5..start + 5 + end])
+        })?;
+    let icon_url = page_url.join(tile_image).ok()?;
+    Some(Icon::new(
+        icon_url.to_string(),
+        "image/png".to_string(),
+        Some(144),
+        Some(144),
+    ).with_purpose(Some("msapplication-tile".to_string())))
 }
 
 /// Gets all available icons from a webpage with enhanced detection and validation
@@ -199,7 +268,7 @@ pub async fn get_page_icons(
                 "image/x-icon".to_string(),
                 Some(16),
                 Some(16),
-            ));
+            ).speculative());
         }
         
         // Try apple-touch-icon.png and apple-touch-icon-precomposed.png
@@ -215,6 +284,7 @@ pub async fn get_page_icons(
         }
         
         let mut manifest_urls = Vec::new();
+        let mut config_urls = Vec::new();
         
         // Try fetching HTML and parsing link tags
         // Create a copy of forwarded headers that we can modify
@@ -361,29 +431,7 @@ pub async fn get_page_icons(
                 for element in document.select(&browserconfig_selector) {
                     if let Some(content) = element.value().attr("content") {
                         if let Ok(config_url) = current_url.join(content) {
-                            // Try to fetch browserconfig.xml
-                            if let Ok(config_response) = client.get(config_url).send().await {
-                                if let Ok((config_body, _)) = validation::read_limited(config_response, MAX_MANIFEST_BYTES).await {
-                                    let config_text = String::from_utf8_lossy(&config_body);
-                                    // Very basic parsing of browserconfig.xml
-                                    if let Some(tile_image) = config_text.lines()
-                                        .find(|line| line.contains("<square"))
-                                        .and_then(|line| {
-                                            let start = line.find("src=\"")?;
-                                            let end = line[start + 5..].find("\"")?;
-                                            Some(&line[start + 5..start + 5 + end])
-                                        }) {
-                                        if let Ok(icon_url) = current_url.join(tile_image) {
-                                            icons.insert(Icon::new(
-                                                icon_url.to_string(),
-                                                "image/png".to_string(),
-                                                Some(144),
-                                                Some(144),
-                                            ).with_purpose(Some("msapplication-tile".to_string())));
-                                        }
-                                    }
-                                }
-                            }
+                            config_urls.push(config_url);
                         }
                     }
                 }
@@ -415,85 +463,16 @@ pub async fn get_page_icons(
             }
         }
         
-        // Process manifest files
-        for manifest_url in &manifest_urls {
-            debug!("Fetching web app manifest from URL: {}", manifest_url);
-            
-            // Create a copy of forwarded headers that we can modify
-            let mut manifest_headers = match forwarded_headers {
-                Some(h) => h.clone(),
-                None => HashMap::new(),
-            };
-            
-            // Use a Chrome/Android User-Agent for manifest requests as they're often used for PWAs
-            manifest_headers.insert("User-Agent".to_string(), 
-                "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36".to_string());
-            
-            let mut manifest_req = client.get(manifest_url.as_str());
-            
-            // Apply headers
-            for (name, value) in &manifest_headers {
-                manifest_req = manifest_req.header(name, value);
-            }
-            
-            if let Ok(manifest_response) = manifest_req.send().await {
-                debug!("Successfully fetched manifest from URL: {}, status: {}", manifest_url, manifest_response.status());
-                if let Ok((manifest_body, false)) = validation::read_limited(manifest_response, MAX_MANIFEST_BYTES).await {
-                    if let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&manifest_body) {
-                        if let Some(manifest_icons) = manifest.get("icons").and_then(|i| i.as_array()) {
-                            for icon in manifest_icons {
-                                if let (Some(src), Some(sizes)) = (
-                                    icon.get("src").and_then(|s| s.as_str()),
-                                    icon.get("sizes").and_then(|s| s.as_str()),
-                                ) {
-                                    if let Ok(icon_url) = manifest_url.join(src) {
-                                        // Parse size from manifest
-                                        let (width, height) = if sizes.contains('x') {
-                                            let parts: Vec<&str> = sizes.split('x').collect();
-                                            if parts.len() == 2 {
-                                                (parts[0].parse().ok(), parts[1].parse().ok())
-                                            } else {
-                                                (None, None)
-                                            }
-                                        } else if let Ok(size) = sizes.parse::<u32>() {
-                                            // Some manifests use single number for square icons
-                                            (Some(size), Some(size))
-                                        } else {
-                                            (None, None)
-                                        };
-                                        
-                                        // Get content type from extension
-                                        let content_type = if src.ends_with(".png") {
-                                            "image/png".to_string()
-                                        } else if src.ends_with(".svg") {
-                                            "image/svg+xml".to_string()
-                                        } else if src.ends_with(".webp") {
-                                            "image/webp".to_string()
-                                        } else if src.ends_with(".jpg") || src.ends_with(".jpeg") {
-                                            "image/jpeg".to_string()
-                                        } else {
-                                            "image/png".to_string() // Default to PNG
-                                        };
-                                        
-                                        // Get purpose if available
-                                        let purpose = icon.get("purpose")
-                                            .and_then(|p| p.as_str())
-                                            .map(|p| p.to_string());
-                                        
-                                        icons.insert(Icon::new(
-                                            icon_url.to_string(),
-                                            content_type,
-                                            width,
-                                            height,
-                                        ).with_purpose(purpose));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Fetch every manifest and browserconfig.xml at once rather than one after another
+        let manifest_fetches = join_all(manifest_urls.iter().map(|manifest_url| {
+            fetch_manifest_icons(client, manifest_url, forwarded_headers)
+        }));
+        let config_fetches = join_all(config_urls.iter().map(|config_url| {
+            fetch_browserconfig_icon(client, config_url, &current_url)
+        }));
+        let (manifest_icons, config_icons) = futures::join!(manifest_fetches, config_fetches);
+        icons.extend(manifest_icons.into_iter().flatten());
+        icons.extend(config_icons.into_iter().flatten());
         
         // Validate all collected icons
         let mut icon_vec: Vec<Icon> = icons.into_iter().collect();
@@ -503,8 +482,8 @@ pub async fn get_page_icons(
             icon.calculate_score();
         }
         
-        // Sort by score (highest first)
-        icon_vec.sort_by(|a, b| b.score.cmp(&a.score));
+        // Icons the page declares come before guessed locations, highest score first within each
+        icon_vec.sort_by(|a, b| a.speculative.cmp(&b.speculative).then(b.score.cmp(&a.score)));
         
         // Validate the top icons (up to 5) in parallel to avoid excessive sequential requests
         debug!("Validating top {} icons in parallel from URL: {}", icon_vec.len().min(5), current_url);
