@@ -4,7 +4,7 @@ use futures::future::{FutureExt, LocalBoxFuture};
 use geticon::cache::{Failure, SwrCache};
 use geticon::models::Icon;
 use geticon::favicon::{find_best_icon_for_size, get_page_icons, html_head};
-use geticon::validation::{extract_meta_refresh_url, is_html_content, read_limited, validate_image_content};
+use geticon::validation::{extract_meta_refresh_url, is_html_content, read_limited, validate_icon, validate_image_content};
 use scraper::Html;
 use std::fs;
 use std::sync::Arc;
@@ -352,4 +352,41 @@ fn test_html_markers_past_first_kb_are_not_html() {
     png.extend_from_slice(b"<body");
     assert!(!is_html_content(&png), "Binary data that happens to contain markup later on is not a page");
     assert!(is_html_content(b"\n\n<html><head><title>Consent</title></head>"));
+}
+
+/// An icon at a plain-HTTP test server URL (Icon::new would rewrite it to https)
+fn icon_at(url: String) -> Icon {
+    Icon { url, content_type: "image/png".to_string(), width: None, height: None, purpose: None, score: 0, speculative: false }
+}
+
+#[tokio::test]
+async fn test_rejected_head_falls_back_to_ranged_get() {
+    let png = fs::read("tests/assets/favicon.png").unwrap();
+    let mut server = mockito::Server::new_async().await;
+    server.mock("HEAD", "/icon.png").with_status(405).create_async().await;
+    let get = server.mock("GET", "/icon.png")
+        .match_header("range", "bytes=0-511")
+        .with_status(206)
+        .with_header("content-type", "image/png")
+        .with_body(&png[..512.min(png.len())])
+        .create_async().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    assert!(validate_icon(&client, &icon_at(format!("{}/icon.png", server.url())), None).await);
+    get.assert_async().await;
+}
+
+#[tokio::test]
+async fn test_missing_icon_is_not_retried_with_get() {
+    let mut server = mockito::Server::new_async().await;
+    server.mock("HEAD", "/icon.png").with_status(404).create_async().await;
+    let get = server.mock("GET", "/icon.png").expect(0).create_async().await;
+    server.mock("HEAD", "/blocked.png").with_status(403).create_async().await;
+    server.mock("GET", "/blocked.png").with_status(403).with_body(b"\x89PNG").create_async().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    assert!(!validate_icon(&client, &icon_at(format!("{}/icon.png", server.url())), None).await);
+    get.assert_async().await;
+    assert!(!validate_icon(&client, &icon_at(format!("{}/blocked.png", server.url())), None).await,
+        "A ranged GET that fails is not a valid icon, whatever its body");
 }

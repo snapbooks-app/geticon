@@ -81,6 +81,11 @@ pub async fn validate_icon(
         Ok(response) => {
             let status = response.status();
             if !status.is_success() {
+                // Some servers and CDNs refuse HEAD outright; fetch the first bytes with GET instead
+                if matches!(status.as_u16(), 400 | 403 | 405 | 501) {
+                    debug!("HEAD rejected with {} for URL: {}, retrying with a ranged GET", status, icon.url);
+                    return peek_content_is_valid_image(client, &icon.url, &headers).await;
+                }
                 debug!("Icon validation failed - HTTP status: {} for URL: {}", status, icon.url);
                 return false;
             }
@@ -166,7 +171,10 @@ async fn peek_content_is_valid_image(
         Ok(peek_response) => {
             let status = peek_response.status();
             debug!("Peek response status: {} for URL: {}", status, url);
-            
+            if !status.is_success() {
+                return false;
+            }
+
             // Servers that ignore the Range header would otherwise send the whole file
             if let Ok((bytes, _)) = read_limited(peek_response, 512).await {
                 if bytes.is_empty() {

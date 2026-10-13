@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Request gzip, brotli and deflate compression from sites
 - Cap every download, counted after decompression: pages are read up to 1 MB, manifests and browserconfig.xml up to 256 KB, and icons over 2 MB are rejected with "Icon is too large"
 - Bound the image cache at 64 MB instead of 2000 entries of any size
+- Fall back to a ranged GET when a server rejects HEAD (400, 403, 405 or 501); such sites now get their icon instead of a 404, in 13 upstream requests instead of 34
+- Check the icons a page declares before guessed locations such as `/favicon.ico` and `/apple-touch-icon.png`
+- Fetch web app manifests and browserconfig.xml in parallel
+- Probe 17 common icon paths instead of 24, best first, and stop at the first batch that finds one (a page with no declared icons: 12 upstream requests instead of 31)
 
 ### Fixed
 - Fixed og:image penalty wrapping to a huge score (or panicking in debug builds) for icons with a low base score
