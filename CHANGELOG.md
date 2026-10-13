@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-13
+
+### Fixed
+- Put `curl` back in the Docker image: the deploy's container health check runs `curl -f http://localhost:8080/health`, so 0.7.0 containers never turned healthy and the deploy waited on them indefinitely
+
+### Security
+- Only use dependency versions published at least 14 days ago: 30 locked crates published in the last 14 days are pinned back to older releases (for example actix-web 4.16.0 to 4.15.0 and tokio 1.53.2 to 1.53.1), and the older compression-codecs moves brotli from 9.0.0 back to 8.0.4
+- Pin the Docker base images to digests (`rust:1.98.1-slim-trixie` and `debian:trixie-20260918-slim`) instead of the moving `rust:1-slim-trixie` and `debian:trixie-slim` tags
+- Pin the workflow's GitHub Actions to commit SHAs
+
 ## [0.7.0] - 2026-10-13
 
 ### Added
