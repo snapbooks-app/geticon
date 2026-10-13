@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-13
+
 ### Added
 - Serve icons for up to 3 days after they go stale while one background task per icon refreshes them; a failed refresh keeps serving the last good icon
 - Concurrent requests for the same uncached page share one lookup (10 simultaneous cold requests: 8 upstream requests instead of 80)
@@ -28,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Check the icons a page declares before guessed locations such as `/favicon.ico` and `/apple-touch-icon.png`
 - Fetch web app manifests and browserconfig.xml in parallel
 - Probe 17 common icon paths instead of 24, best first, and stop at the first batch that finds one (a page with no declared icons: 12 upstream requests instead of 31)
+- Docker image is now a multi-stage build on Debian 13 (trixie): it ships only the binary and its runtime libraries (143 MB, where the old image was based on the 1.19 GB Rust toolchain image), and dependencies build in their own cached layer
+- Commit `Cargo.lock` and build the Docker image with `--locked`
+- README: building from source needs Rust 1.89 or later (required by the locked dependencies)
 
 ### Fixed
 - Fixed og:image penalty wrapping to a huge score (or panicking in debug builds) for icons with a low base score

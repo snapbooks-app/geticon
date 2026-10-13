@@ -19,7 +19,7 @@ A fast and efficient favicon fetching service built in Rust. GetIcon provides a 
 
 ### Option 1: Using Rust
 
-1. Ensure you have Rust installed (1.75.0 or later)
+1. Ensure you have Rust installed (1.89.0 or later)
 2. Clone the repository:
 ```bash
 git clone https://github.com/yourusername/geticon.git
