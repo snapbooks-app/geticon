@@ -1,14 +1,13 @@
-use actix_web::{get, web, HttpResponse, HttpRequest, http::header};
+use actix_web::{get, web, HttpResponse, HttpRequest, http::{header, StatusCode}};
 use md5;
 use crate::url_utils::normalize_url;
 use crate::models::{Icon, IconResponse};
 use crate::favicon::{get_page_icons, find_best_icon_for_size, select_user_agent_for_icon};
 use crate::validation::{validate_image_content, is_html_content};
-use crate::cache::IconCache;
+use crate::cache::{CacheEntry, CachedImage, Failure, IconCache};
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
-use bytes::Bytes;
 use std::collections::HashMap;
 use log::{warn, debug, error};
 use url::Url;
@@ -119,20 +118,162 @@ fn extract_headers_to_forward(req: &HttpRequest) -> HashMap<String, String> {
     headers
 }
 
-/// Runs icon discovery under DISCOVERY_DEADLINE; None means it ran out of time
-async fn discover_icons(
+/// Logs why a lookup failed, reports it to Sentry if enabled, and returns it for caching
+fn fail(status: StatusCode, message: &str, details: String) -> Failure {
+    let level = if status.is_server_error() {
+        error!("{}", details);
+        sentry::Level::Error
+    } else {
+        warn!("{}", details);
+        sentry::Level::Warning
+    };
+    if env::var("SENTRY_DSN").is_ok() {
+        sentry::capture_message(&details, level);
+    }
+    Failure { status, message: message.to_string() }
+}
+
+/// The response every request for a failed lookup gets until it is retried
+fn failure_response(failure: &Failure) -> HttpResponse {
+    HttpResponse::build(failure.status).body(failure.message.clone())
+}
+
+/// Stale entries are being refreshed in the background, so clients should check back sooner
+fn cache_control_for(is_stale: bool) -> &'static str {
+    if is_stale { "public, max-age=600" } else { "public, max-age=7200" }
+}
+
+/// Finds and validates a page's icons, giving up after DISCOVERY_DEADLINE
+async fn discover(
+    client: reqwest::Client,
+    url: Url,
+    forwarded_headers: HashMap<String, String>,
+) -> Result<Vec<Icon>, Failure> {
+    let discovery = get_page_icons(&client, &url, Some(&forwarded_headers), None);
+    match actix_web::rt::time::timeout(DISCOVERY_DEADLINE, discovery).await {
+        Ok(icons) if !icons.is_empty() => Ok(icons),
+        Ok(_) => Err(fail(
+            StatusCode::NOT_FOUND,
+            "No icons found",
+            format!("Failed to find icons for URL: {}", url),
+        )),
+        Err(_) => Err(fail(
+            StatusCode::GATEWAY_TIMEOUT,
+            "Timed out looking for icons",
+            format!("Icon discovery timed out after {}s for URL: {}", DISCOVERY_DEADLINE.as_secs(), url),
+        )),
+    }
+}
+
+/// A page's validated icons and whether they are stale; concurrent misses share one discovery
+async fn load_icons(
+    cache: &IconCache,
     client: &reqwest::Client,
     url: &Url,
     forwarded_headers: &HashMap<String, String>,
-) -> Option<Vec<Icon>> {
-    let discovery = get_page_icons(client, url, Some(forwarded_headers), None);
-    match actix_web::rt::time::timeout(DISCOVERY_DEADLINE, discovery).await {
-        Ok(icons) => Some(icons),
-        Err(_) => {
-            warn!("Icon discovery timed out after {}s for URL: {}", DISCOVERY_DEADLINE.as_secs(), url);
-            None
+) -> (Arc<CacheEntry<Vec<Icon>>>, bool) {
+    let (client, page_url, headers) = (client.clone(), url.clone(), forwarded_headers.clone());
+    cache.discovery.get_or_load(url.as_str(), move || discover(client, page_url, headers)).await
+}
+
+/// Downloads an icon and checks that it really is an image
+async fn fetch_image(
+    client: reqwest::Client,
+    icon: Icon,
+    forwarded_headers: HashMap<String, String>,
+    page_url: Url,
+) -> Result<CachedImage, Failure> {
+    // Override the User-Agent with our selected one based on icon type
+    let mut headers = forwarded_headers;
+    headers.insert("User-Agent".to_string(), select_user_agent_for_icon(&icon).to_string());
+
+    let mut request_builder = client.get(&icon.url);
+
+    // Apply headers
+    for (name, value) in &headers {
+        request_builder = request_builder.header(name, value);
+    }
+
+    let response = match request_builder.send().await {
+        Ok(response) => response,
+        Err(err) => {
+            let (status, message) = if err.is_timeout() {
+                (StatusCode::GATEWAY_TIMEOUT, format!("Request timed out while fetching icon: {}", err))
+            } else if err.is_connect() {
+                (StatusCode::BAD_GATEWAY, format!("Connection error while fetching icon: {}", err))
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to fetch icon: {}", err))
+            };
+            return Err(fail(status, &message, format!("Failed to fetch icon: {}", err)));
+        }
+    };
+
+    // Must be an image, including after a redirect (e.g. to a cookie consent page)
+    if let Some(content_type) = response.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) {
+        if !content_type.starts_with("image/") {
+            let final_url = response.url().as_str();
+            return Err(if final_url != icon.url {
+                fail(
+                    StatusCode::NOT_FOUND,
+                    &format!("Icon redirected to non-image resource: {}", final_url),
+                    format!("Icon redirected to non-image resource: {} -> {} (Content-Type: {})",
+                        icon.url, final_url, content_type),
+                )
+            } else {
+                fail(
+                    StatusCode::NOT_FOUND,
+                    &format!("Invalid content type for icon: {}", content_type),
+                    format!("Invalid content type for icon: {} (Content-Type: {})", icon.url, content_type),
+                )
+            });
         }
     }
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            &format!("Icon not found. Status: {}", status),
+            format!("Icon not found. Status: {} for icon URL: {}", status, icon.url),
+        ));
+    }
+
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(err) => return Err(fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to read icon content",
+            format!("Failed to read icon content: {}", err),
+        )),
+    };
+
+    if bytes.is_empty() {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            "Icon found but has zero size",
+            format!("Zero-size icon detected for URL: {} from icon URL: {}", page_url, icon.url),
+        ));
+    }
+
+    // Check for HTML content disguised as an image
+    if is_html_content(&bytes) {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            "Icon found but content is HTML, not an image",
+            format!("HTML content disguised as an image for URL: {} from icon URL: {}", page_url, icon.url),
+        ));
+    }
+
+    if !validate_image_content(&bytes, &icon.content_type) {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            "Icon found but content is not a valid image",
+            format!("Invalid image content for URL: {} from icon URL: {}", page_url, icon.url),
+        ));
+    }
+
+    let etag = format!("\"{:x}\"", md5::compute(&bytes));
+    Ok(CachedImage { content: bytes, content_type: icon.content_type, etag })
 }
 
 /// Handler for /img endpoint - returns the best favicon as an image
@@ -159,421 +300,48 @@ pub async fn get_favicon_img(
     // Get size parameter if provided
     let requested_size = url.get("size").and_then(|s| s.parse::<u32>().ok());
     
-    // Create a cache key that includes the size parameter if provided
-    let cache_key = match requested_size {
-        Some(size) => format!("{}:{}", normalized_url, size),
-        None => normalized_url.to_string(),
-    };
-    
-    // Check if the icon is in the cache (either main or expired)
-    match cache.get(&cache_key).await {
-        Some((cached_entry, needs_refresh)) => {
-            // Check if the client has the same version (ETag)
-            if let Some(if_none_match) = req.headers().get(header::IF_NONE_MATCH) {
-                if if_none_match.to_str().unwrap_or("") == cached_entry.etag {
-                    debug!("Client already has latest version (ETag match): {}", cache_key);
-                    return HttpResponse::NotModified()
-                        .append_header((header::CACHE_CONTROL, "public, max-age=7200"))
-                        .finish();
-                }
-            }
-            
-            // If from expired cache, trigger background refresh and return shorter TTL
-            if needs_refresh {
-                debug!("Serving from expired cache while refreshing: {}", cache_key);
-                
-                // Extract headers to forward for the background task
-                let forwarded_headers = extract_headers_to_forward(&req);
-                
-                // Clone variables for background task
-                let cache_clone = cache.clone();
-                let cache_key_clone = cache_key.clone();
-                let client_clone = client.clone();
-                let normalized_url_clone = normalized_url.clone();
-                let forwarded_headers_clone = forwarded_headers.clone();
-                let requested_size_clone = requested_size;
-                
-                // Launch background task to refresh the entry
-                actix_web::rt::spawn(async move {
-                    debug!("Background refresh task started for: {}", cache_key_clone);
-                    
-                    // Fetch icons from website (already validated)
-                    let validated_icons = match discover_icons(
-                        client_clone.as_ref(),
-                        &normalized_url_clone,
-                        &forwarded_headers_clone
-                    ).await {
-                        Some(icons) if !icons.is_empty() => icons,
-                        _ => {
-                            debug!("Background refresh: no icons found");
-                            return;
-                        }
-                    };
-
-                    // Select best icon
-                    let best_icon = match find_best_icon_for_size(&validated_icons, requested_size_clone) {
-                        Some(icon) => icon,
-                        None => {
-                            debug!("Background refresh: no suitable icon found");
-                            return;
-                        }
-                    };
-                    
-                    // Create a copy of forwarded headers that we can modify
-                    let mut headers = forwarded_headers_clone.clone();
-                    
-                    // Override the User-Agent with our selected one based on icon type
-                    headers.insert("User-Agent".to_string(), select_user_agent_for_icon(best_icon).to_string());
-                    
-                    // Fetch the icon
-                    let mut request_builder = client_clone.get(&best_icon.url);
-                    
-                    // Apply headers
-                    for (name, value) in &headers {
-                        request_builder = request_builder.header(name, value);
-                    }
-                    
-                    // Send the request
-                    match request_builder.send().await {
-                        Ok(response) => {
-                            // Verify response is valid
-                            if !response.status().is_success() {
-                                debug!("Background refresh: icon request failed with status {}", response.status());
-                                return;
-                            }
-                            
-                            match response.bytes().await {
-                                Ok(bytes) => {
-                                    // Validate content
-                                    if bytes.is_empty() || is_html_content(&bytes) {
-                                        debug!("Background refresh: invalid icon content");
-                                        return;
-                                    }
-                                    
-                                    let is_valid_image = validate_image_content(&bytes, &best_icon.content_type);
-                                    if !is_valid_image {
-                                        debug!("Background refresh: invalid image content");
-                                        return;
-                                    }
-                                    
-                                    let etag = format!("\"{:x}\"", md5::compute(&bytes));
-                                    
-                                    // Update main cache with the new content
-                                    cache_clone.insert(
-                                        cache_key_clone.clone(), // Clone since we need to use key again
-                                        bytes,
-                                        best_icon.content_type.clone(),
-                                        etag
-                                    ).await;
-                                    
-                                    // Remove from expired cache since it's now in main cache
-                                    cache_clone.remove_from_expired(&cache_key_clone).await;
-                                    
-                                    debug!("Background refresh completed successfully");
-                                },
-                                Err(err) => {
-                                    debug!("Background refresh: Failed to read icon content: {}", err);
-                                }
-                            }
-                        },
-                        Err(err) => {
-                            debug!("Background refresh: Failed to fetch icon: {}", err);
-                        }
-                    }
-                });
-                
-                // Return the expired cached icon with a shorter cache duration (10 minutes)
-                return HttpResponse::Ok()
-                    .content_type(cached_entry.content_type.as_str())
-                    .append_header((header::CACHE_CONTROL, "public, max-age=600")) // 10 minutes
-                    .append_header((header::ETAG, cached_entry.etag.clone()))
-                    .body(cached_entry.content.clone());
-            }
-            
-            // If from main cache, return normal TTL
-            debug!("Serving from main cache: {}", cache_key);
-            return HttpResponse::Ok()
-                .content_type(cached_entry.content_type.as_str())
-                .append_header((header::CACHE_CONTROL, "public, max-age=7200"))
-                .append_header((header::ETAG, cached_entry.etag.clone()))
-                .body(cached_entry.content.clone());
-        },
-        None => {
-            // No cache hit in either main or expired cache
-        }
-    }
-    
-    // Check if this URL is in the negative cache (previously failed)
-    if cache.is_negative(&cache_key).await {
-        debug!("URL in negative cache, returning 404: {}", cache_key);
-        return HttpResponse::NotFound().body("Icon not found (cached negative result)");
-    }
-
-    let response = fetch_icon(&req, &client, &cache, &normalized_url, requested_size, &cache_key).await;
-
-    // Remember every failure so repeat requests skip the whole lookup
-    if response.status().is_client_error() || response.status().is_server_error() {
-        debug!("Adding to negative cache: {}", cache_key);
-        cache.insert_negative(cache_key).await;
-    }
-    response
-}
-
-/// Discovers, fetches and caches the best icon for a URL that missed the cache
-async fn fetch_icon(
-    req: &HttpRequest,
-    client: &reqwest::Client,
-    cache: &IconCache,
-    normalized_url: &Url,
-    requested_size: Option<u32>,
-    cache_key: &str,
-) -> HttpResponse {
     // Extract headers to forward
-    let forwarded_headers = extract_headers_to_forward(req);
+    let forwarded_headers = extract_headers_to_forward(&req);
 
-    // If not in cache, fetch icons from the website (already validated)
-    let validated_icons = match discover_icons(client, normalized_url, &forwarded_headers).await {
-        Some(icons) if !icons.is_empty() => icons,
-        Some(_) => {
-            // Log the failure with more details
-            warn!("Failed to find icons for URL: {}", normalized_url);
-
-            // Also send to Sentry if enabled
-            if env::var("SENTRY_DSN").is_ok() {
-                sentry::capture_message(
-                    &format!("Failed to find icons for URL: {}", normalized_url),
-                    sentry::Level::Warning
-                );
-            }
-            return HttpResponse::NotFound().body("No icons found")
-        }
-        None => return HttpResponse::GatewayTimeout().body("Timed out looking for icons"),
+    let (discovery, discovery_stale) = load_icons(&cache, &client, &normalized_url, &forwarded_headers).await;
+    let icons = match &discovery.value {
+        Ok(icons) => icons,
+        Err(failure) => return failure_response(failure),
     };
 
-    // Select the best icon based on requested size or highest score from validated icons
-    let best_icon = match find_best_icon_for_size(&validated_icons, requested_size) {
-        Some(icon) => icon,
+    // Select the best icon based on requested size or highest score
+    let best_icon = match find_best_icon_for_size(icons, requested_size) {
+        Some(icon) => icon.clone(),
         None => return HttpResponse::NotFound().body("No suitable icon found"),
     };
     
-    // Create a copy of forwarded headers that we can modify
-    let mut headers = forwarded_headers.clone();
+    // Images are cached per icon URL, so sizes that pick the same icon share one download
+    let icon_url = best_icon.url.clone();
+    let (client, page_url) = (client.get_ref().clone(), normalized_url.clone());
+    let (image_entry, image_stale) = cache.images
+        .get_or_load(&icon_url, move || fetch_image(client, best_icon, forwarded_headers, page_url))
+        .await;
+    let image = match &image_entry.value {
+        Ok(image) => image,
+        Err(failure) => return failure_response(failure),
+    };
+    let cache_control = cache_control_for(discovery_stale || image_stale);
     
-    // Override the User-Agent with our selected one based on icon type
-    headers.insert("User-Agent".to_string(), select_user_agent_for_icon(best_icon).to_string());
-    
-    // Fetch the icon with the appropriate User-Agent
-    let mut request_builder = client.get(&best_icon.url);
-    
-    // Apply headers
-    for (name, value) in &headers {
-        request_builder = request_builder.header(name, value);
-    }
-    
-    // Send the request
-    match request_builder.send().await {
-        Ok(response) => {
-            // Check if the response was redirected to a non-image resource
-            let final_url = response.url().to_string();
-            if final_url != best_icon.url {
-                // The request was redirected, check if the final URL is still an image
-                if let Some(content_type) = response.headers().get(header::CONTENT_TYPE) {
-                    if let Ok(content_type_str) = content_type.to_str() {
-                        // If redirected to a non-image resource (like HTML), reject it
-                        if !content_type_str.starts_with("image/") {
-                            // Log the redirect
-                            warn!("Icon redirected to non-image resource: {} -> {} (Content-Type: {})", 
-                                best_icon.url, final_url, content_type_str);
-                            
-                            // Also send to Sentry if enabled
-                            if env::var("SENTRY_DSN").is_ok() {
-                                sentry::capture_message(
-                                    &format!("Icon redirected to non-image resource: {} -> {} (Content-Type: {})", 
-                                        best_icon.url, final_url, content_type_str),
-                                    sentry::Level::Warning
-                                );
-                            }
-                            
-                            return HttpResponse::NotFound()
-                                .body(format!("Icon redirected to non-image resource: {}", final_url));
-                        }
-                    }
-                }
-            }
-            
-            // Check content type header to ensure it's an image
-            if let Some(content_type) = response.headers().get(header::CONTENT_TYPE) {
-                if let Ok(content_type_str) = content_type.to_str() {
-                    if !content_type_str.starts_with("image/") {
-                        // Log the invalid content type
-                        warn!("Invalid content type for icon: {} (Content-Type: {})", 
-                            best_icon.url, content_type_str);
-                        
-                        // Also send to Sentry if enabled
-                        if env::var("SENTRY_DSN").is_ok() {
-                            sentry::capture_message(
-                                &format!("Invalid content type for icon: {} (Content-Type: {})", 
-                                    best_icon.url, content_type_str),
-                                sentry::Level::Warning
-                            );
-                        }
-                        
-                        return HttpResponse::NotFound()
-                            .body(format!("Invalid content type for icon: {}", content_type_str));
-                    }
-                }
-            }
-            
-            if response.status().is_success() {
-                match response.bytes().await {
-                    Ok(bytes) => {
-                        // Validate content size
-                        if bytes.is_empty() {
-                            // Log the zero-size icon
-                            warn!("Zero-size icon detected for URL: {} from icon URL: {}", 
-                                normalized_url, best_icon.url);
-                            
-                            // Also send to Sentry if enabled
-                            if env::var("SENTRY_DSN").is_ok() {
-                                sentry::capture_message(
-                                    &format!("Zero-size icon detected for URL: {} from icon URL: {}", 
-                                        normalized_url, best_icon.url),
-                                    sentry::Level::Warning
-                                );
-                            }
-                            
-                            return HttpResponse::NotFound()
-                                .body("Icon found but has zero size");
-                        }
-                        
-                        // Check for HTML content disguised as an image
-                        if is_html_content(&bytes) {
-                            // Log the HTML content disguised as an image
-                            warn!("HTML content disguised as an image for URL: {} from icon URL: {}", 
-                                normalized_url, best_icon.url);
-                            
-                            // Also send to Sentry if enabled
-                            if env::var("SENTRY_DSN").is_ok() {
-                                sentry::capture_message(
-                                    &format!("HTML content disguised as an image for URL: {} from icon URL: {}", 
-                                        normalized_url, best_icon.url),
-                                    sentry::Level::Warning
-                                );
-                            }
-                            
-                            return HttpResponse::NotFound()
-                                .body("Icon found but content is HTML, not an image");
-                        }
-                        
-                        // Validate image content using our validation function
-                        let is_valid_image = validate_image_content(&bytes, &best_icon.content_type);
-                        
-                        if !is_valid_image {
-                            // Log the invalid image
-                            warn!("Invalid image content for URL: {} from icon URL: {}", 
-                                normalized_url, best_icon.url);
-                            
-                            // Also send to Sentry if enabled
-                            if env::var("SENTRY_DSN").is_ok() {
-                                sentry::capture_message(
-                                    &format!("Invalid image content for URL: {} from icon URL: {}", 
-                                        normalized_url, best_icon.url),
-                                    sentry::Level::Warning
-                                );
-                            }
-                            
-                            return HttpResponse::NotFound()
-                                .body("Icon found but content is not a valid image");
-                        }
-                        
-                        let etag = format!("\"{:x}\"", md5::compute(&bytes));
-
-                        // Store in main cache, and if it was in expired cache, remove it from there
-                        cache.insert(
-                            cache_key.to_string(),
-                            bytes.clone(),
-                            best_icon.content_type.clone(),
-                            etag.clone()
-                        ).await;
-
-                        // Also check if we should remove it from expired cache
-                        cache.remove_from_expired(cache_key).await;
-
-                        // Check if the client has the same version (after caching, so revalidations warm the cache too)
-                        if let Some(if_none_match) = req.headers().get(header::IF_NONE_MATCH) {
-                            if if_none_match.to_str().unwrap_or("") == etag {
-                                return HttpResponse::NotModified().finish();
-                            }
-                        }
-
-                        HttpResponse::Ok()
-                            .content_type(best_icon.content_type.as_str())
-                            .append_header((header::CACHE_CONTROL, "public, max-age=7200"))
-                            .append_header((header::ETAG, etag))
-                            .body(bytes)
-                    },
-                    Err(err) => {
-                        // Log the error
-                        error!("Failed to read icon content: {}", err);
-                        
-                        // Also send to Sentry if enabled
-                        if env::var("SENTRY_DSN").is_ok() {
-                            sentry::capture_message(
-                                &format!("Failed to read icon content: {}", err),
-                                sentry::Level::Error
-                            );
-                        }
-                        
-                        HttpResponse::InternalServerError()
-                            .body("Failed to read icon content")
-                    }
-                }
-            } else {
-                let status = response.status();
-                
-                // Log the error
-                warn!("Icon not found. Status: {}", status);
-                
-                // Also send to Sentry if enabled
-                if env::var("SENTRY_DSN").is_ok() {
-                    sentry::capture_message(
-                        &format!("Icon not found. Status: {}", status),
-                        sentry::Level::Warning
-                    );
-                }
-                
-                HttpResponse::NotFound()
-                    .body(format!("Icon not found. Status: {}", status))
-            }
-        }
-        Err(err) => {
-            // Log the error
-            error!("Failed to fetch icon: {}", err);
-            
-            // Also send to Sentry if enabled
-            if env::var("SENTRY_DSN").is_ok() {
-                sentry::capture_message(
-                    &format!("Failed to fetch icon: {}", err),
-                    sentry::Level::Error
-                );
-            }
-            
-            // Determine appropriate status code based on error type
-            if err.is_timeout() {
-                warn!("Request timed out while fetching icon: {}", err);
-                HttpResponse::GatewayTimeout()
-                    .body(format!("Request timed out while fetching icon: {}", err))
-            } else if err.is_connect() {
-                warn!("Connection error while fetching icon: {}", err);
-                HttpResponse::BadGateway()
-                    .body(format!("Connection error while fetching icon: {}", err))
-            } else {
-                error!("Failed to fetch icon: {}", err);
-                HttpResponse::InternalServerError()
-                    .body(format!("Failed to fetch icon: {}", err))
-            }
+    // Check if the client has the same version (ETag)
+    if let Some(if_none_match) = req.headers().get(header::IF_NONE_MATCH) {
+        if if_none_match.to_str().unwrap_or("") == image.etag {
+            debug!("Client already has latest version (ETag match): {}", icon_url);
+            return HttpResponse::NotModified()
+                .append_header((header::CACHE_CONTROL, cache_control))
+                .finish();
         }
     }
+
+    HttpResponse::Ok()
+        .content_type(image.content_type.as_str())
+        .append_header((header::CACHE_CONTROL, cache_control))
+        .append_header((header::ETAG, image.etag.clone()))
+        .body(image.content.clone())
 }
 
 /// Health check endpoint
@@ -582,8 +350,6 @@ async fn fetch_icon(
         debug!("Health check requested");
         
         // Get cache statistics for monitoring
-        let (main_count, expired_count, negative_count) = cache.stats().await;
-        
         HttpResponse::Ok()
             .content_type("application/json")
             .body(format!(
@@ -591,12 +357,11 @@ async fn fetch_icon(
                     "status":"ok",
                     "service":"geticon",
                     "cache_stats":{{
-                        "main_cache":{},
-                        "expired_cache":{},
-                        "negative_cache":{}
+                        "discovery_cache":{},
+                        "image_cache":{}
                     }}
                 }}"#,
-                main_count, expired_count, negative_count
+                cache.discovery.entry_count(), cache.images.entry_count()
             ))
     }
 
@@ -624,56 +389,23 @@ pub async fn get_favicon_json(
     // Get size parameter if provided
     let requested_size = url.get("size").and_then(|s| s.parse::<u32>().ok());
     
-    // Create a cache key that includes the size parameter if provided
-    let cache_key = match requested_size {
-        Some(size) => format!("{}:json:{}", normalized_url, size),
-        None => format!("{}:json", normalized_url),
-    };
-    
-    // Check if the response is in the cache
-    if let Some((cached_entry, needs_refresh)) = cache.get(&cache_key).await {
-        // For JSON endpoint, we'll use the same approach as for images
-        // If from expired cache, return a shorter TTL
-        let max_age = if needs_refresh { "600" } else { "3600" };
-        
-        // Return the cached JSON response
-        return HttpResponse::Ok()
-            .content_type(cached_entry.content_type.as_str())
-            .append_header((header::CACHE_CONTROL, format!("public, max-age={}", max_age)))
-            .append_header((header::ETAG, cached_entry.etag.clone()))
-            .body(cached_entry.content.clone());
-    }
-
-    // Check if this URL is in the negative cache (previously failed)
-    if cache.is_negative(&cache_key).await {
-        debug!("URL in negative cache, returning 404: {}", cache_key);
-        return HttpResponse::NotFound().body("No icons found (cached negative result)");
-    }
-
     // Extract headers to forward
     let forwarded_headers = extract_headers_to_forward(&req);
 
-    // If not in cache, fetch icons from the website (already validated)
-    let final_icons = match discover_icons(client.as_ref(), &normalized_url, &forwarded_headers).await {
-        Some(icons) if !icons.is_empty() => icons,
-        Some(_) => {
-            warn!("Failed to find icons for URL: {}", normalized_url);
-            cache.insert_negative(cache_key).await;
-            return HttpResponse::NotFound().body("No icons found");
-        }
-        None => {
-            cache.insert_negative(cache_key).await;
-            return HttpResponse::GatewayTimeout().body("Timed out looking for icons");
-        }
+    // Shares the cached discovery with /img, whatever the size
+    let (discovery, is_stale) = load_icons(&cache, &client, &normalized_url, &forwarded_headers).await;
+    let icons = match &discovery.value {
+        Ok(icons) => icons,
+        Err(failure) => return failure_response(failure),
     };
 
     // Select best icon based on requested size or highest score
-    let best_icon = find_best_icon_for_size(&final_icons, requested_size).cloned();
+    let best_icon = find_best_icon_for_size(icons, requested_size).cloned();
 
     // Create response
     let response = IconResponse {
         url: normalized_url.host_str().unwrap_or(url_str).to_string(),
-        icons: final_icons,
+        icons: icons.clone(),
         best_icon,
     };
     
@@ -682,17 +414,9 @@ pub async fn get_favicon_json(
             // Generate ETag for the JSON response
             let etag = format!("\"{:x}\"", md5::compute(json.as_bytes()));
             
-            // Store in cache (as bytes for consistency with the image endpoint)
-            cache.insert(
-                cache_key,
-                Bytes::from(json.clone()),
-                "application/json".to_string(),
-                etag.clone()
-            ).await;
-            
             HttpResponse::Ok()
                 .content_type("application/json")
-                .append_header((header::CACHE_CONTROL, "public, max-age=7200"))
+                .append_header((header::CACHE_CONTROL, cache_control_for(is_stale)))
                 .append_header((header::ETAG, etag))
                 .body(json)
         },

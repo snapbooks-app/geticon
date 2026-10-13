@@ -134,10 +134,13 @@ Returns a JSON object with:
 ## Cache Support
 
 GetIcon implements efficient caching through:
-- Server-side in-memory cache with 2-hour TTL
+- Server-side in-memory cache: icons stay fresh for 2 hours, then are served for up to 3 more days while a background task refreshes them
+- One lookup per page, shared by `/img` (every size) and `/json`; downloaded images are cached per icon URL
+- Concurrent requests for the same uncached page share a single lookup
+- Failed lookups are cached for 1 hour, then retried on the next request
 - Consistent icon selection for the same URL and size
 - ETag headers for client-side caching
-- Cache-Control headers with a 2-hour max age
+- Cache-Control headers with a 2-hour max age (10 minutes while a stale icon is being refreshed)
 - 304 Not Modified responses when content hasn't changed
 
 ## Icon Detection

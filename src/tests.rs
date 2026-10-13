@@ -1,24 +1,100 @@
 // Tests for the GetIcon application
-use geticon::cache::IconCache;
+use actix_web::http::StatusCode;
+use futures::future::{FutureExt, LocalBoxFuture};
+use geticon::cache::{Failure, SwrCache};
 use geticon::models::Icon;
 use geticon::favicon::{find_best_icon_for_size, get_page_icons};
 use geticon::validation::validate_image_content;
 use std::fs;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use bytes::Bytes;
 use url::Url;
 
-#[tokio::test]
-async fn test_cache_reads_do_not_extend_ttl() {
-    let cache = IconCache::new(10, 1);
-    cache.insert("k".to_string(), Bytes::from_static(b"x"), "image/png".to_string(), "\"e\"".to_string()).await;
+/// A cache loader that counts its calls and returns `value` after `delay`
+fn counting_loader(
+    calls: &Arc<AtomicUsize>,
+    value: Result<u32, Failure>,
+    delay: Duration,
+) -> impl FnOnce() -> LocalBoxFuture<'static, Result<u32, Failure>> {
+    let calls = calls.clone();
+    move || async move {
+        calls.fetch_add(1, Ordering::SeqCst);
+        actix_rt::time::sleep(delay).await;
+        value
+    }.boxed_local()
+}
 
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    assert!(cache.get("k").await.is_some(), "Entry should still be cached before its TTL");
+fn not_found() -> Failure {
+    Failure { status: StatusCode::NOT_FOUND, message: "No icons found".to_string() }
+}
 
-    // This read used to re-insert the entry, pushing its expiry out to 1.6s
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    assert!(cache.get("k").await.is_none(), "Reads must not extend the TTL");
+#[actix_rt::test]
+async fn test_concurrent_misses_share_one_load() {
+    let cache = SwrCache::new(10, Duration::from_secs(60), Duration::from_secs(60), Duration::from_secs(600));
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let requests = (0..10).map(|_| cache.get_or_load("k", counting_loader(&calls, Ok(1), Duration::from_millis(50))));
+    let results = futures::future::join_all(requests).await;
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "Concurrent misses should share one load");
+    assert!(results.iter().all(|(entry, is_stale)| entry.value.as_ref().ok() == Some(&1) && !is_stale));
+}
+
+#[actix_rt::test]
+async fn test_stale_entry_is_served_while_one_refresh_runs() {
+    let cache = SwrCache::new(10, Duration::from_millis(100), Duration::from_secs(60), Duration::from_secs(600));
+    let calls = Arc::new(AtomicUsize::new(0));
+    cache.get_or_load("k", counting_loader(&calls, Ok(1), Duration::ZERO)).await;
+    actix_rt::time::sleep(Duration::from_millis(150)).await;
+
+    // Stale reads return the old value at once; only the first starts a refresh
+    for _ in 0..5 {
+        let (entry, is_stale) = cache.get_or_load("k", counting_loader(&calls, Ok(2), Duration::from_millis(50))).await;
+        assert_eq!(entry.value.as_ref().ok(), Some(&1));
+        assert!(is_stale);
+    }
+    actix_rt::time::sleep(Duration::from_millis(100)).await;
+
+    let (entry, is_stale) = cache.get_or_load("k", counting_loader(&calls, Ok(3), Duration::ZERO)).await;
+    assert_eq!(entry.value.as_ref().ok(), Some(&2), "The refreshed value should replace the stale one");
+    assert!(!is_stale);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "One initial load and one refresh");
+}
+
+#[actix_rt::test]
+async fn test_failed_refresh_keeps_last_good_value() {
+    let cache = SwrCache::new(10, Duration::from_millis(100), Duration::from_secs(60), Duration::from_secs(600));
+    let calls = Arc::new(AtomicUsize::new(0));
+    cache.get_or_load("k", counting_loader(&calls, Ok(1), Duration::ZERO)).await;
+    actix_rt::time::sleep(Duration::from_millis(150)).await;
+
+    cache.get_or_load("k", counting_loader(&calls, Err(not_found()), Duration::ZERO)).await;
+    actix_rt::time::sleep(Duration::from_millis(50)).await;
+
+    // The site is down: keep serving the old icon and wait out the failure window before retrying
+    let (entry, _) = cache.get_or_load("k", counting_loader(&calls, Ok(3), Duration::ZERO)).await;
+    assert_eq!(entry.value.as_ref().ok(), Some(&1));
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "No retry inside the failure window");
+}
+
+#[actix_rt::test]
+async fn test_failures_are_cached_then_retried_inline() {
+    let cache = SwrCache::new(10, Duration::from_secs(60), Duration::from_millis(100), Duration::from_secs(600));
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let (entry, _) = cache.get_or_load("k", counting_loader(&calls, Err(not_found()), Duration::ZERO)).await;
+    assert!(entry.value.is_err());
+    let (entry, _) = cache.get_or_load("k", counting_loader(&calls, Ok(1), Duration::ZERO)).await;
+    assert!(entry.value.is_err(), "A fresh failure should come from the cache");
+
+    // After the failure window the next request loads inline instead of getting the old failure
+    actix_rt::time::sleep(Duration::from_millis(150)).await;
+    let (entry, is_stale) = cache.get_or_load("k", counting_loader(&calls, Ok(1), Duration::ZERO)).await;
+    assert_eq!(entry.value.as_ref().ok(), Some(&1));
+    assert!(!is_stale);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
