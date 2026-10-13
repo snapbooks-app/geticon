@@ -153,6 +153,7 @@ async fn try_additional_icon_sources(
 }
 
 /// Gets all available icons from a webpage with enhanced detection and validation
+/// Returns only icons that passed validation, best first (empty if none did)
 pub async fn get_page_icons(
     client: &reqwest::Client, 
     url: &Url,
@@ -221,7 +222,16 @@ pub async fn get_page_icons(
             request_builder = request_builder.header(name, value);
         }
         
-        if let Ok(response) = request_builder.send().await {
+        let html_response = request_builder.send().await;
+        if let Err(err) = &html_response {
+            // Every other candidate lives on this same host, so probing them would only time out too
+            if err.is_connect() {
+                warn!("Could not connect to {}: {}", current_url, err);
+                return Vec::new();
+            }
+        }
+
+        if let Ok(response) = html_response {
             // Update current_url to the final URL after following any HTTP redirects
             current_url = response.url().clone();
             debug!("Successfully fetched HTML from URL: {}, status: {}", current_url, response.status());
@@ -524,10 +534,14 @@ pub async fn get_page_icons(
             return result;
         }
         
-        // If still no icons found, return the original list (which might have invalid icons)
-        // This allows the handler to attempt to fetch them anyway as a last resort
-        warn!("No valid icons found for URL: {}, returning unvalidated icons as last resort", current_url);
-        return icon_vec;
+        // Last resort: the lower-scored icons that weren't in the first batch
+        let remaining: Vec<Icon> = icon_vec.into_iter().skip(5).collect();
+        let mut result = validation::validate_icons(client, &remaining, &headers).await;
+        if result.is_empty() {
+            warn!("No valid icons found for URL: {}", current_url);
+        }
+        result.sort_by(|a, b| b.score.cmp(&a.score));
+        return result;
     }
 }
 
