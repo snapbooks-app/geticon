@@ -49,12 +49,20 @@ pub struct SwrCache<T> {
 }
 
 impl<T: Clone + Send + Sync + 'static> SwrCache<T> {
+    /// `max_capacity` is in the units `weigher` returns (e.g. entries or bytes);
     /// `fresh_for` applies to successes and `failure_fresh_for` to failures;
     /// a success is served stale until `max_age` after it was fetched
-    pub fn new(max_capacity: u64, fresh_for: Duration, failure_fresh_for: Duration, max_age: Duration) -> Self {
+    pub fn new(
+        max_capacity: u64,
+        weigher: fn(&Result<T, Failure>) -> u32,
+        fresh_for: Duration,
+        failure_fresh_for: Duration,
+        max_age: Duration,
+    ) -> Self {
         SwrCache {
             entries: Cache::builder()
                 .max_capacity(max_capacity)
+                .weigher(move |_key: &String, entry: &Arc<CacheEntry<T>>| weigher(&entry.value))
                 .time_to_live(max_age)
                 .build(),
             refreshing: Cache::builder()
@@ -146,17 +154,27 @@ pub struct IconCache {
 }
 
 /// Fresh for 2 hours (failures 1 hour), served stale for up to 3 days while refreshing
-fn default_swr_cache<T: Clone + Send + Sync + 'static>() -> SwrCache<T> {
+fn default_swr_cache<T: Clone + Send + Sync + 'static>(
+    max_capacity: u64,
+    weigher: fn(&Result<T, Failure>) -> u32,
+) -> SwrCache<T> {
     SwrCache::new(
-        2000,
+        max_capacity,
+        weigher,
         Duration::from_secs(2 * 60 * 60),
         Duration::from_secs(60 * 60),
         Duration::from_secs(3 * 24 * 60 * 60),
     )
 }
 
-/// Create the icon cache with default sizes and freshness windows
+/// Create the icon cache: up to 2000 pages, and up to 64 MB of images
 pub fn create_default_icon_cache() -> IconCache {
     info!("Created icon cache (2-hour freshness, served stale for up to 3 days while refreshing)");
-    IconCache { discovery: default_swr_cache(), images: default_swr_cache() }
+    IconCache {
+        discovery: default_swr_cache(2000, |_| 1),
+        images: default_swr_cache(64 * 1024 * 1024, |value| match value {
+            Ok(image) => image.content.len().try_into().unwrap_or(u32::MAX),
+            Err(failure) => failure.message.len().try_into().unwrap_or(u32::MAX),
+        }),
+    }
 }

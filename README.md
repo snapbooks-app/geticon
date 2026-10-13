@@ -138,6 +138,7 @@ GetIcon implements efficient caching through:
 - One lookup per page, shared by `/img` (every size) and `/json`; downloaded images are cached per icon URL
 - Concurrent requests for the same uncached page share a single lookup
 - Failed lookups are cached for 1 hour, then retried on the next request
+- Images are cached up to 64 MB in total; icons larger than 2 MB are not served
 - Consistent icon selection for the same URL and size
 - ETag headers for client-side caching
 - Cache-Control headers with a 2-hour max age (10 minutes while a stale icon is being refreshed)

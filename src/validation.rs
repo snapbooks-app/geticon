@@ -1,6 +1,7 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use reqwest;
 use std::collections::HashMap;
+use std::io::Cursor;
 use crate::models::Icon;
 use std::time::Duration;
 use log::{info, debug};
@@ -12,14 +13,31 @@ pub fn is_image_content_type(content_type: &str) -> bool {
     content_type.starts_with("image/")
 }
 
+/// Reads at most `limit` bytes of a response body, counted after decompression;
+/// the flag is true when the body was longer and got cut off
+pub async fn read_limited(mut response: reqwest::Response, limit: usize) -> Result<(Bytes, bool), reqwest::Error> {
+    let mut body = BytesMut::new();
+    while let Some(chunk) = response.chunk().await? {
+        let room = limit - body.len();
+        if chunk.len() > room {
+            body.extend_from_slice(&chunk[..room]);
+            return Ok((body.freeze(), true));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((body.freeze(), false))
+}
+
 /// Checks if content bytes represent HTML rather than an image
 pub fn is_html_content(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"<!DOCTYPE") || 
-    bytes.starts_with(b"<html") || 
-    bytes.starts_with(b"<HTML") ||
-    bytes.windows(7).any(|window| window == b"<script") ||
-    bytes.windows(5).any(|window| window == b"<body") ||
-    bytes.windows(5).any(|window| window == b"<head")
+    // HTML markup shows up at the very start of a page, so the first KB is enough
+    let start = &bytes[..bytes.len().min(1024)];
+    start.starts_with(b"<!DOCTYPE") ||
+    start.starts_with(b"<html") ||
+    start.starts_with(b"<HTML") ||
+    start.windows(7).any(|window| window == b"<script") ||
+    start.windows(5).any(|window| window == b"<body") ||
+    start.windows(5).any(|window| window == b"<head")
 }
 
 /// Checks if content bytes represent a valid image based on file signatures
@@ -149,7 +167,8 @@ async fn peek_content_is_valid_image(
             let status = peek_response.status();
             debug!("Peek response status: {} for URL: {}", status, url);
             
-            if let Ok(bytes) = peek_response.bytes().await {
+            // Servers that ignore the Range header would otherwise send the whole file
+            if let Ok((bytes, _)) = read_limited(peek_response, 512).await {
                 if bytes.is_empty() {
                     debug!("Peek content is empty for URL: {}", url);
                     return false;
@@ -234,10 +253,7 @@ pub async fn validate_icons(
 }
 
 /// Extracts redirect URL from HTML meta refresh tag if present
-pub fn extract_meta_refresh_url(html_content: &[u8]) -> Option<String> {
-    let html_str = String::from_utf8_lossy(html_content);
-    let document = Html::parse_document(&html_str);
-    
+pub fn extract_meta_refresh_url(document: &Html) -> Option<String> {
     // Select meta refresh tags
     let selector = Selector::parse("meta[http-equiv='refresh']").unwrap();
     
@@ -253,6 +269,11 @@ pub fn extract_meta_refresh_url(html_content: &[u8]) -> Option<String> {
     }
     
     None
+}
+
+/// Reads just the image header, which is enough to tell a real image from a mislabeled file
+fn read_image_dimensions(bytes: &[u8]) -> image::ImageResult<(u32, u32)> {
+    image::io::Reader::new(Cursor::new(bytes)).with_guessed_format()?.into_dimensions()
 }
 
 /// Validates image content by checking file signatures and using the image crate
@@ -277,7 +298,7 @@ pub fn validate_image_content(bytes: &Bytes, content_type: &str) -> bool {
         return false;
     }
     
-    // Then use the image crate for deeper validation
+    // Then parse the image header; a full decode costs milliseconds per icon and catches little more
     let result = match content_type {
         "image/svg+xml" => {
             debug!("SVG validation passed (signature check only)");
@@ -285,7 +306,7 @@ pub fn validate_image_content(bytes: &Bytes, content_type: &str) -> bool {
         },
         "image/png" => {
             // Special handling for PNG files
-            match image::load_from_memory(bytes) {
+            match read_image_dimensions(bytes) {
                 Ok(_) => {
                     debug!("PNG validation passed");
                     true
@@ -307,7 +328,7 @@ pub fn validate_image_content(bytes: &Bytes, content_type: &str) -> bool {
             }
         },
         _ => {
-            let load_result = image::load_from_memory(bytes).is_ok();
+            let load_result = read_image_dimensions(bytes).is_ok();
             if load_result {
                 debug!("Image validation passed for content type: {}", content_type);
             } else {
