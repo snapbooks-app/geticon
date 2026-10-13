@@ -1,17 +1,33 @@
-FROM rust:1-slim-bullseye
+FROM rust:1-slim-trixie AS build
 
-# Install dependencies required for building
-RUN apt-get update && apt-get install -y \
-    pkg-config \
+# OpenSSL headers for sentry's native-tls transport
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkgconf \
     libssl-dev \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
-COPY . .
+
+# Build dependencies in their own layer, so code changes don't recompile them
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs && touch src/lib.rs \
+    && cargo build --release --locked \
+    && rm -rf src
 
 # Build the application with release optimizations
-RUN cargo build --release
+COPY src ./src
+RUN touch src/main.rs src/lib.rs && cargo build --release --locked
+
+# Runtime image: just the binary on a slim Debian, without the Rust toolchain
+FROM debian:trixie-slim
+
+# OpenSSL and CA certificates for sentry's native-tls transport
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3t64 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /usr/src/app/target/release/geticon /usr/local/bin/geticon
 
 # Expose the port the app runs on
 EXPOSE 8080
@@ -26,4 +42,4 @@ ENV SENTRY_ENVIRONMENT="production"
 # Release is automatically set from Cargo.toml version
 
 # Run the binary
-CMD ["./target/release/geticon"]
+CMD ["geticon"]
