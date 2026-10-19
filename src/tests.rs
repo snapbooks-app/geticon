@@ -354,9 +354,49 @@ fn test_html_markers_past_first_kb_are_not_html() {
     assert!(is_html_content(b"\n\n<html><head><title>Consent</title></head>"));
 }
 
-/// An icon at a plain-HTTP test server URL (Icon::new would rewrite it to https)
 fn icon_at(url: String) -> Icon {
-    Icon { url, content_type: "image/png".to_string(), width: None, height: None, purpose: None, score: 0, speculative: false }
+    Icon::new(url, "image/png".to_string(), None, None)
+}
+
+#[test]
+fn test_icon_url_keeps_scheme_and_query() {
+    let thumbnail = Icon::new(
+        "https://admin.mekke.no/thumbnail.php?h=1400&img=data/images//3104/AB1.jpg".to_string(),
+        "image/jpeg".to_string(),
+        None,
+        None,
+    );
+    assert_eq!(thumbnail.url, "https://admin.mekke.no/thumbnail.php?h=1400&img=data/images//3104/AB1.jpg");
+
+    let plain_http = Icon::new("http://www.lier.kommune.no/icon.png".to_string(), "image/png".to_string(), None, None);
+    assert_eq!(plain_http.url, "http://www.lier.kommune.no/icon.png");
+
+    let with_fragment = Icon::new(
+        "https://example.com/favicon.svg?auto=format&h=32&w=32#top".to_string(),
+        "image/svg+xml".to_string(),
+        None,
+        None,
+    );
+    assert_eq!(with_fragment.url, "https://example.com/favicon.svg?auto=format&h=32&w=32", "Only the fragment is dropped");
+}
+
+#[tokio::test]
+async fn test_declared_icon_is_requested_with_its_query() {
+    let mut server = mockito::Server::new_async().await;
+    server.mock("GET", "/")
+        .with_header("content-type", "text/html")
+        .with_body(r#"<html><head><meta property="og:image" content="/thumbnail.php?h=1400&amp;img=AB1.jpg#top"></head></html>"#)
+        .create_async().await;
+    // Like admin.mekke.no, the image only exists with its query string
+    server.mock("HEAD", "/thumbnail.php?h=1400&img=AB1.jpg")
+        .with_header("content-type", "image/jpeg")
+        .create_async().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    let icons = get_page_icons(&client, &Url::parse(&server.url()).unwrap(), None, None).await;
+
+    let urls: Vec<&str> = icons.iter().map(|icon| icon.url.as_str()).collect();
+    assert_eq!(urls, [format!("{}/thumbnail.php?h=1400&img=AB1.jpg", server.url())]);
 }
 
 #[tokio::test]

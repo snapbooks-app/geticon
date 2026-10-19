@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Request icons at the exact URL the page declares, dropping only the fragment: query strings were cut off and `http://` icons were switched to `https://`, so icons such as aub.no's `og:image` (`thumbnail.php?h=1400&img=…`) got a 400 and were skipped
+
 ## [0.7.1] - 2026-10-13
 
 ### Fixed
