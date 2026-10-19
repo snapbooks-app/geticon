@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Keep the query string of icon URLs: it was cut off, so icons such as aub.no's `og:image` (`thumbnail.php?h=1400&img=…`) got a 400 and were skipped. `http://` icons are switched to `https://` only on `https://` pages, as browsers do
+- Guess an undeclared icon type from the URL path instead of the end of the `href`, so eg.no's `favicon.svg?auto=format&h=32&w=32` is checked as an SVG instead of failing as an ICO
+- Unescape `&amp;` in browserconfig.xml tile URLs
+
 ## [0.7.1] - 2026-10-13
 
 ### Fixed

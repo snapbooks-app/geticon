@@ -46,6 +46,16 @@ pub fn html_head(page: &str) -> &str {
     }
 }
 
+/// An icon URL a page, manifest or browserconfig.xml declares, resolved against that document.
+/// Like browsers, an http:// icon on an https:// document is fetched over https.
+pub fn resolve_icon_url(document_url: &Url, href: &str) -> Option<Url> {
+    let mut icon_url = document_url.join(href).ok()?;
+    if document_url.scheme() == "https" && icon_url.scheme() == "http" {
+        icon_url.set_scheme("https").ok()?;
+    }
+    Some(icon_url)
+}
+
 /// Try additional common icon locations that might not be explicitly referenced
 async fn try_additional_icon_sources(
     client: &reqwest::Client,
@@ -162,7 +172,7 @@ async fn fetch_manifest_icons(
                             icon.get("src").and_then(|s| s.as_str()),
                             icon.get("sizes").and_then(|s| s.as_str()),
                         ) {
-                            if let Ok(icon_url) = manifest_url.join(src) {
+                            if let Some(icon_url) = resolve_icon_url(manifest_url, src) {
                                 // Parse size from manifest
                                 let (width, height) = if sizes.contains('x') {
                                     let parts: Vec<&str> = sizes.split('x').collect();
@@ -178,14 +188,15 @@ async fn fetch_manifest_icons(
                                     (None, None)
                                 };
 
-                                // Get content type from extension
-                                let content_type = if src.ends_with(".png") {
+                                // Get content type from extension, ignoring any query string
+                                let path = icon_url.path();
+                                let content_type = if path.ends_with(".png") {
                                     "image/png".to_string()
-                                } else if src.ends_with(".svg") {
+                                } else if path.ends_with(".svg") {
                                     "image/svg+xml".to_string()
-                                } else if src.ends_with(".webp") {
+                                } else if path.ends_with(".webp") {
                                     "image/webp".to_string()
-                                } else if src.ends_with(".jpg") || src.ends_with(".jpeg") {
+                                } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
                                     "image/jpeg".to_string()
                                 } else {
                                     "image/png".to_string() // Default to PNG
@@ -225,7 +236,8 @@ async fn fetch_browserconfig_icon(client: &reqwest::Client, config_url: &Url, pa
             let end = line[start + 5..].find("\"")?;
             Some(&line[start + 5..start + 5 + end])
         })?;
-    let icon_url = page_url.join(tile_image).ok()?;
+    // The src is XML, so a query string's & arrives as &amp;
+    let icon_url = resolve_icon_url(page_url, &tile_image.replace("&amp;", "&"))?;
     Some(Icon::new(
         icon_url.to_string(),
         "image/png".to_string(),
@@ -354,20 +366,21 @@ pub async fn get_page_icons(
                     
                     if tag_name == "link" {
                         if let Some(href) = element.value().attr("href") {
-                            if let Ok(icon_url) = current_url.join(href) {
+                            if let Some(icon_url) = resolve_icon_url(&current_url, href) {
                                 let mut content_type = element.value().attr("type")
                                     .unwrap_or("image/x-icon")
                                     .to_string();
                                     
-                                // Infer type from extension if not specified
+                                // Infer type from extension if not specified, ignoring any query string
                                 if content_type == "image/x-icon" {
-                                    if href.ends_with(".png") {
+                                    let path = icon_url.path();
+                                    if path.ends_with(".png") {
                                         content_type = "image/png".to_string();
-                                    } else if href.ends_with(".svg") {
+                                    } else if path.ends_with(".svg") {
                                         content_type = "image/svg+xml".to_string();
-                                    } else if href.ends_with(".webp") {
+                                    } else if path.ends_with(".webp") {
                                         content_type = "image/webp".to_string();
-                                    } else if href.ends_with(".jpg") || href.ends_with(".jpeg") {
+                                    } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
                                         content_type = "image/jpeg".to_string();
                                     }
                                 }
@@ -404,7 +417,7 @@ pub async fn get_page_icons(
                     } else if tag_name == "meta" && element.value().attr("name") == Some("msapplication-TileImage") {
                         // Handle Windows tile image
                         if let Some(content) = element.value().attr("content") {
-                            if let Ok(icon_url) = current_url.join(content) {
+                            if let Some(icon_url) = resolve_icon_url(&current_url, content) {
                                 icons.insert(Icon::new(
                                     icon_url.to_string(),
                                     "image/png".to_string(),
@@ -440,7 +453,7 @@ pub async fn get_page_icons(
                 let og_selector = Selector::parse("meta[property='og:image']").unwrap();
                 for element in document.select(&og_selector) {
                     if let Some(content) = element.value().attr("content") {
-                        if let Ok(og_url) = current_url.join(content) {
+                        if let Some(og_url) = resolve_icon_url(&current_url, content) {
                             icons.insert(Icon::new(
                                 og_url.to_string(),
                                 "image/jpeg".to_string(), // Assume JPEG, will be corrected if needed

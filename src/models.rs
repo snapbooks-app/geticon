@@ -1,5 +1,5 @@
 use serde::Serialize;
-use crate::url_utils::normalize_url_string;
+use url::Url;
 
 #[derive(Serialize, Hash, Eq, PartialEq, Debug, Clone)]
 pub struct Icon {
@@ -18,13 +18,20 @@ pub struct Icon {
 
 impl Icon {
     pub fn new(url: String, content_type: String, width: Option<u32>, height: Option<u32>) -> Self {
-        // Normalize URL for storage and comparison
-        let normalized_url = normalize_url_string(&url)
-            .map(|u| format!("https://{}", u))
-            .unwrap_or(url);
-            
+        // Icon URLs are already absolute: keep their scheme and query, which some servers need,
+        // but not a fragment or credentials. Other schemes, such as data:, are kept whole.
+        let url = match Url::parse(&url) {
+            Ok(mut parsed) if matches!(parsed.scheme(), "http" | "https") => {
+                parsed.set_fragment(None);
+                let _ = parsed.set_username("");
+                let _ = parsed.set_password(None);
+                parsed.to_string()
+            }
+            _ => url,
+        };
+
         Icon {
-            url: normalized_url,
+            url,
             content_type,
             width,
             height,
