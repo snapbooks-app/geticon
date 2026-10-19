@@ -3,7 +3,7 @@ use actix_web::http::StatusCode;
 use futures::future::{FutureExt, LocalBoxFuture};
 use geticon::cache::{Failure, SwrCache};
 use geticon::models::Icon;
-use geticon::favicon::{find_best_icon_for_size, get_page_icons, html_head};
+use geticon::favicon::{find_best_icon_for_size, get_page_icons, html_head, resolve_icon_url};
 use geticon::validation::{extract_meta_refresh_url, is_html_content, read_limited, validate_icon, validate_image_content};
 use scraper::Html;
 use std::fs;
@@ -378,6 +378,25 @@ fn test_icon_url_keeps_scheme_and_query() {
         None,
     );
     assert_eq!(with_fragment.url, "https://example.com/favicon.svg?auto=format&h=32&w=32", "Only the fragment is dropped");
+
+    let with_credentials = Icon::new("https://user:pass@cdn.example.com/a.png?x=1".to_string(), "image/png".to_string(), None, None);
+    assert_eq!(with_credentials.url, "https://cdn.example.com/a.png?x=1");
+
+    let data_uri = "data:image/svg+xml,<svg><rect fill='#fff'/></svg>";
+    let inline = Icon::new(data_uri.to_string(), "image/svg+xml".to_string(), None, None);
+    assert_eq!(inline.url, data_uri, "A # in a data: URI is content, not a fragment");
+}
+
+#[test]
+fn test_http_icon_on_https_page_is_upgraded() {
+    let og_image = "http://www.lier.kommune.no/globalassets/godt-nyttar-2021.png";
+    let https_page = Url::parse("https://www.lier.kommune.no/").unwrap();
+    let http_page = Url::parse("http://www.lier.kommune.no/").unwrap();
+
+    assert_eq!(resolve_icon_url(&https_page, og_image).unwrap().as_str(),
+        "https://www.lier.kommune.no/globalassets/godt-nyttar-2021.png");
+    assert_eq!(resolve_icon_url(&http_page, og_image).unwrap().as_str(), og_image, "An http page keeps its http icons");
+    assert_eq!(resolve_icon_url(&https_page, "/icon.png?v=2").unwrap().as_str(), "https://www.lier.kommune.no/icon.png?v=2");
 }
 
 #[tokio::test]
@@ -397,6 +416,50 @@ async fn test_declared_icon_is_requested_with_its_query() {
 
     let urls: Vec<&str> = icons.iter().map(|icon| icon.url.as_str()).collect();
     assert_eq!(urls, [format!("{}/thumbnail.php?h=1400&img=AB1.jpg", server.url())]);
+}
+
+#[tokio::test]
+async fn test_icon_type_is_guessed_from_path_not_query() {
+    let mut server = mockito::Server::new_async().await;
+    server.mock("GET", "/")
+        .with_header("content-type", "text/html")
+        .with_body(r#"<html><head>
+            <link rel="icon" href="/favicon.svg?auto=format&amp;h=32&amp;w=32">
+            <link rel="manifest" href="/manifest.json">
+        </head></html>"#)
+        .create_async().await;
+    server.mock("GET", "/manifest.json")
+        .with_body(r#"{"icons": [{"src": "/app.webp?v=2", "sizes": "512x512"}]}"#)
+        .create_async().await;
+    server.mock("HEAD", "/favicon.svg?auto=format&h=32&w=32").with_header("content-type", "image/svg+xml").create_async().await;
+    server.mock("HEAD", "/app.webp?v=2").with_header("content-type", "image/webp").create_async().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    let icons = get_page_icons(&client, &Url::parse(&server.url()).unwrap(), None, None).await;
+
+    // Like eg.no's icon, which was checked as an ICO because its href ends in "w=32"
+    let mut types: Vec<&str> = icons.iter().map(|icon| icon.content_type.as_str()).collect();
+    types.sort();
+    assert_eq!(types, ["image/svg+xml", "image/webp"]);
+}
+
+#[tokio::test]
+async fn test_browserconfig_tile_query_is_unescaped() {
+    let mut server = mockito::Server::new_async().await;
+    server.mock("GET", "/")
+        .with_header("content-type", "text/html")
+        .with_body(r#"<html><head><meta name="msapplication-config" content="/browserconfig.xml"></head></html>"#)
+        .create_async().await;
+    server.mock("GET", "/browserconfig.xml")
+        .with_body("<browserconfig><msapplication><tile>\n<square150x150logo src=\"/tile.php?w=150&amp;h=150\"/>\n</tile></msapplication></browserconfig>")
+        .create_async().await;
+    server.mock("HEAD", "/tile.php?w=150&h=150").with_header("content-type", "image/png").create_async().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    let icons = get_page_icons(&client, &Url::parse(&server.url()).unwrap(), None, None).await;
+
+    let urls: Vec<&str> = icons.iter().map(|icon| icon.url.as_str()).collect();
+    assert_eq!(urls, [format!("{}/tile.php?w=150&h=150", server.url())]);
 }
 
 #[tokio::test]

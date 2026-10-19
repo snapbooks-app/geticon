@@ -18,13 +18,16 @@ pub struct Icon {
 
 impl Icon {
     pub fn new(url: String, content_type: String, width: Option<u32>, height: Option<u32>) -> Self {
-        // Icon URLs are already absolute: keep their scheme and query, which some servers need
+        // Icon URLs are already absolute: keep their scheme and query, which some servers need,
+        // but not a fragment or credentials. Other schemes, such as data:, are kept whole.
         let url = match Url::parse(&url) {
-            Ok(mut parsed) => {
+            Ok(mut parsed) if matches!(parsed.scheme(), "http" | "https") => {
                 parsed.set_fragment(None);
+                let _ = parsed.set_username("");
+                let _ = parsed.set_password(None);
                 parsed.to_string()
             }
-            Err(_) => url,
+            _ => url,
         };
 
         Icon {
